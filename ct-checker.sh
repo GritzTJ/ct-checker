@@ -14,7 +14,7 @@ set -uo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.0.1"
 readonly CRT_SH_API="https://crt.sh"
 
 # ---------------------------------------------------------------------------
@@ -295,6 +295,7 @@ extract_fqdns() {
     local ct_file="$1"
     local fqdns_file="$2"
     local wildcards_file="$3"
+    local emails_file="$4"
 
     log_info "Extraction des FQDNs uniques depuis les données CT..."
 
@@ -307,24 +308,35 @@ extract_fqdns() {
         | grep -v '^$' \
         | sort -u > /tmp/ct_all_names_$$.txt
 
-    # Séparation : wildcards vs FQDNs normaux
-    grep '^\*\.' /tmp/ct_all_names_$$.txt > "$wildcards_file" 2>/dev/null || true
-    grep -v '^\*\.' /tmp/ct_all_names_$$.txt > "$fqdns_file" 2>/dev/null || true
+    # Séparation en trois catégories :
+    # 1. Adresses e-mail (contiennent @) — SANs de type rfc822Name
+    grep '@' /tmp/ct_all_names_$$.txt > "$emails_file" 2>/dev/null || true
+    # 2. Wildcards (commencent par *.) — hors e-mails
+    grep -v '@' /tmp/ct_all_names_$$.txt | grep '^\*\.' > "$wildcards_file" 2>/dev/null || true
+    # 3. FQDNs normaux — ni e-mail, ni wildcard
+    grep -v '@' /tmp/ct_all_names_$$.txt | grep -v '^\*\.' > "$fqdns_file" 2>/dev/null || true
 
     rm -f /tmp/ct_all_names_$$.txt
 
-    local fqdn_count wildcard_count
+    local fqdn_count wildcard_count email_count
     fqdn_count=$(wc -l < "$fqdns_file" | tr -d ' ')
     wildcard_count=$(wc -l < "$wildcards_file" | tr -d ' ')
+    email_count=$(wc -l < "$emails_file" | tr -d ' ')
 
-    # Supprime le fichier wildcards s'il est vide
+    # Supprime les fichiers vides
     [ "$wildcard_count" -eq 0 ] && rm -f "$wildcards_file"
+    [ "$email_count" -eq 0 ] && rm -f "$emails_file"
 
     log_success "${fqdn_count} FQDNs uniques extraits"
     if [ "$wildcard_count" -gt 0 ]; then
         log_success "${wildcard_count} entrées wildcard isolées (stockées séparément)"
     else
         log_info "Aucun wildcard trouvé"
+    fi
+    if [ "$email_count" -gt 0 ]; then
+        log_success "${email_count} adresses e-mail isolées (stockées dans emails.txt)"
+    else
+        log_info "Aucune adresse e-mail trouvée"
     fi
 }
 
@@ -484,8 +496,9 @@ generate_summary() {
     local cert_count="$3"
     local fqdn_count="$4"
     local wildcard_count="$5"
-    local dns_stats="$6"
-    local summary_file="$7"
+    local email_count="$6"
+    local dns_stats="$7"
+    local summary_file="$8"
 
     local dns_total dns_resolved dns_unresolved
     IFS='|' read -r dns_total dns_resolved dns_unresolved <<< "$dns_stats"
@@ -495,12 +508,17 @@ generate_summary() {
         resolution_rate=$(awk "BEGIN {printf \"%.1f%%\", ($dns_resolved / $dns_total) * 100}")
     fi
 
-    # Ligne wildcards conditionnelle
-    local wildcard_line
+    # Lignes conditionnelles wildcards et emails
+    local wildcard_line email_line
     if [ "$wildcard_count" -gt 0 ]; then
         wildcard_line="  Wildcards      : ${wildcard_count} (stockés dans wildcards.txt, non vérifiés DNS)"
     else
         wildcard_line="  Wildcards      : Aucun"
+    fi
+    if [ "$email_count" -gt 0 ]; then
+        email_line="  Adresses e-mail: ${email_count} (stockées dans emails.txt, non vérifiées DNS)"
+    else
+        email_line="  Adresses e-mail: Aucune"
     fi
 
     # Chiffres DNS en largeur fixe pour alignement cohérent
@@ -513,7 +531,7 @@ generate_summary() {
     # on l'ajoute manuellement pour éviter l'affichage "0 octet").
     # Utilisation de printf -v pour préserver les sauts de ligne ($() les supprimerait).
     local file_list="" _entry
-    local _known_files=(raw_ct_logs.json all_fqdns.txt wildcards.txt dns_resolved.txt dns_unresolved.txt)
+    local _known_files=(raw_ct_logs.json all_fqdns.txt wildcards.txt emails.txt dns_resolved.txt dns_unresolved.txt)
     for _f in "${_known_files[@]}"; do
         local _fp="${run_dir}/${_f}"
         if [ -f "$_fp" ]; then
@@ -548,8 +566,9 @@ generate_summary() {
 
   RÉSULTATS FQDNs
   ---------------
-  FQDNs uniques  : ${fqdn_count} (wildcards exclus)
+  FQDNs uniques  : ${fqdn_count} (wildcards et e-mails exclus)
 ${wildcard_line}
+${email_line}
 
 ================================================================================
 
@@ -646,6 +665,7 @@ main() {
     local raw_ct_file="${run_dir}/raw_ct_logs.json"
     local all_fqdns_file="${run_dir}/all_fqdns.txt"
     local wildcards_file="${run_dir}/wildcards.txt"
+    local emails_file="${run_dir}/emails.txt"
     local dns_resolved_file="${run_dir}/dns_resolved.txt"
     local dns_unresolved_file="${run_dir}/dns_unresolved.txt"
     local summary_file="${run_dir}/summary.txt"
@@ -660,11 +680,13 @@ main() {
     # -------------------------------------------------------------------------
     echo ""
     echo "${BOLD}━━━ ÉTAPE 2/4 : Extraction des FQDNs ━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    extract_fqdns "$raw_ct_file" "$all_fqdns_file" "$wildcards_file"
-    local fqdn_count wildcard_count
+    extract_fqdns "$raw_ct_file" "$all_fqdns_file" "$wildcards_file" "$emails_file"
+    local fqdn_count wildcard_count email_count
     fqdn_count=$(wc -l < "$all_fqdns_file" | tr -d ' ')
     wildcard_count=0
     [ -f "$wildcards_file" ] && wildcard_count=$(wc -l < "$wildcards_file" | tr -d ' ')
+    email_count=0
+    [ -f "$emails_file" ] && email_count=$(wc -l < "$emails_file" | tr -d ' ')
 
     # -------------------------------------------------------------------------
     echo ""
@@ -676,7 +698,7 @@ main() {
     echo ""
     echo "${BOLD}━━━ ÉTAPE 4/4 : Génération du rapport ━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     generate_summary "$DOMAIN" "$run_dir" "$cert_count" "$fqdn_count" \
-        "$wildcard_count" "$dns_stats" "$summary_file"
+        "$wildcard_count" "$email_count" "$dns_stats" "$summary_file"
 
     # -------------------------------------------------------------------------
     echo ""
