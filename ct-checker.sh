@@ -640,7 +640,7 @@ main() {
 
     local _border="═══════════════════════════════════════════════════════════════"
     local _title="Certificate Transparency Log Checker  v${SCRIPT_VERSION}"
-    local _inner=${#_border}
+    local _inner=63   # largeur visuelle fixe (63 × ═) — ${#} compterait des octets en locale C
     local _tlen=${#_title}
     local _pl=$(( (_inner - _tlen) / 2 ))
     local _pr=$(( _inner - _tlen - _pl ))
