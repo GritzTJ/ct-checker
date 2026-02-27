@@ -25,6 +25,7 @@ Il est conçu pour fonctionner sur **n'importe quelle distribution GNU/Linux** e
 - Effectue **deux requêtes** : domaine exact + tous les sous-domaines (`%.domain.com`), puis fusionne et déduplique les résultats
 - Extrait tous les **FQDNs uniques** trouvés dans les certificats
 - Isole les **wildcards** (`*.domain.com`) dans un fichier séparé (non soumis à la vérification DNS)
+- Isole les **adresses e-mail** (SANs de type `rfc822Name`) dans un fichier séparé (non soumises à la vérification DNS)
 - Vérifie la **résolution DNS** (enregistrements A, AAAA, CNAME) pour chaque FQDN
 - Ne crée les fichiers de résultats **que s'ils contiennent des données** (aucun fichier vide)
 - Génère un **rapport de synthèse** horodaté
@@ -94,12 +95,13 @@ Les résultats sont organisés par domaine et horodatés pour conserver l'histor
     ├── raw_ct_logs.json      Données JSON brutes issues de crt.sh
     ├── all_fqdns.txt         Tous les FQDNs uniques extraits
     ├── wildcards.txt         Entrées wildcard (si présentes)
+    ├── emails.txt            Adresses e-mail extraites des SANs (si présentes)
     ├── dns_resolved.txt      FQDNs avec enregistrement DNS valide
     ├── dns_unresolved.txt    FQDNs sans enregistrement DNS (si présents)
     └── summary.txt           Rapport de synthèse
 ```
 
-> `wildcards.txt` et `dns_unresolved.txt` ne sont créés que s'ils contiennent des données.
+> `wildcards.txt`, `emails.txt` et `dns_unresolved.txt` ne sont créés que s'ils contiennent des données.
 
 ### Sources CT Logs
 
@@ -130,6 +132,7 @@ It is designed to run on **any GNU/Linux distribution** and automatically instal
 - Performs **two queries**: exact domain + all subdomains (`%.domain.com`), then merges and deduplicates results
 - Extracts all **unique FQDNs** found in certificates
 - Isolates **wildcards** (`*.domain.com`) into a separate file (excluded from DNS verification)
+- Isolates **email addresses** (`rfc822Name` SANs) into a separate file (excluded from DNS verification)
 - Verifies **DNS resolution** (A, AAAA, CNAME records) for each FQDN
 - Only creates result files **if they contain data** (no empty files)
 - Generates a **timestamped summary report**
@@ -199,12 +202,13 @@ Results are organised by domain and timestamped to preserve the history of analy
     ├── raw_ct_logs.json      Raw JSON data from crt.sh
     ├── all_fqdns.txt         All unique extracted FQDNs
     ├── wildcards.txt         Wildcard entries (if any)
+    ├── emails.txt            Email addresses extracted from SANs (if any)
     ├── dns_resolved.txt      FQDNs with a valid DNS record
     ├── dns_unresolved.txt    FQDNs with no DNS record (if any)
     └── summary.txt           Summary report
 ```
 
-> `wildcards.txt` and `dns_unresolved.txt` are only created if they contain data.
+> `wildcards.txt`, `emails.txt` and `dns_unresolved.txt` are only created if they contain data.
 
 ### CT Log Sources
 
