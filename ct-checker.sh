@@ -38,6 +38,7 @@ STDOUT_TMPDIR=""        # tmpdir pour les modes stdout (nettoyé par trap EXIT)
 DNS_TOOL=""
 OS_NAME="unknown"
 PKG_MANAGER=""
+_CLEANUP_FILES=()         # fichiers temporaires à supprimer en cas d'interruption
 
 # ---------------------------------------------------------------------------
 # Fonctions de log
@@ -249,6 +250,7 @@ query_ct_logs() {
     local tmp1 tmp2
     tmp1=$(mktemp /tmp/ct_check_XXXXXX.json)
     tmp2=$(mktemp /tmp/ct_check_XXXXXX.json)
+    _CLEANUP_FILES+=("$tmp1" "$tmp2")
 
     # Requête 1 : sous-domaines (%.domain.com)
     log_debug "Requête 1 : sous-domaines (%.${domain})"
@@ -309,22 +311,26 @@ extract_fqdns() {
 
     # name_value peut contenir plusieurs SANs séparés par \n
     # On extrait, on nettoie, on déduplique
+    local tmp_names
+    tmp_names=$(mktemp /tmp/ct_all_names_XXXXXX.txt)
+    _CLEANUP_FILES+=("$tmp_names")
+
     jq -r '.[].name_value' "$ct_file" \
         | tr ',' '\n' \
         | sed 's/^[[:space:]]*//' \
         | sed 's/[[:space:]]*$//' \
         | grep -v '^$' \
-        | sort -u > /tmp/ct_all_names_$$.txt
+        | sort -u > "$tmp_names"
 
     # Séparation en trois catégories :
     # 1. Adresses e-mail (contiennent @) — SANs de type rfc822Name
-    grep '@' /tmp/ct_all_names_$$.txt > "$emails_file" 2>/dev/null || true
+    grep '@' "$tmp_names" > "$emails_file" 2>/dev/null || true
     # 2. Wildcards (commencent par *.) — hors e-mails
-    grep -v '@' /tmp/ct_all_names_$$.txt | grep '^\*\.' > "$wildcards_file" 2>/dev/null || true
+    grep -v '@' "$tmp_names" | grep '^\*\.' > "$wildcards_file" 2>/dev/null || true
     # 3. FQDNs normaux — ni e-mail, ni wildcard
-    grep -v '@' /tmp/ct_all_names_$$.txt | grep -v '^\*\.' > "$fqdns_file" 2>/dev/null || true
+    grep -v '@' "$tmp_names" | grep -v '^\*\.' > "$fqdns_file" 2>/dev/null || true
 
-    rm -f /tmp/ct_all_names_$$.txt
+    rm -f "$tmp_names"
 
     local fqdn_count wildcard_count email_count
     fqdn_count=$(wc -l < "$fqdns_file" | tr -d ' ')
@@ -441,6 +447,7 @@ verify_dns() {
     local tmp_resolved tmp_unresolved
     tmp_resolved=$(mktemp /tmp/ct_dns_res_XXXXXX.txt)
     tmp_unresolved=$(mktemp /tmp/ct_dns_nores_XXXXXX.txt)
+    _CLEANUP_FILES+=("$tmp_resolved" "$tmp_unresolved")
 
     local current=0
     while IFS= read -r fqdn; do
@@ -554,7 +561,7 @@ generate_summary() {
 
     local resolution_rate="N/A"
     if [ "$dns_total" -gt 0 ] 2>/dev/null; then
-        resolution_rate=$(awk "BEGIN {printf \"%.1f%%\", ($dns_resolved / $dns_total) * 100}")
+        resolution_rate=$(awk -v r="$dns_resolved" -v t="$dns_total" 'BEGIN {printf "%.1f%%", (r / t) * 100}')
     fi
 
     # Lignes conditionnelles wildcards et emails
@@ -667,7 +674,8 @@ parse_args() {
 # Nettoyage en cas d'interruption
 # ---------------------------------------------------------------------------
 cleanup() {
-    rm -f /tmp/ct_check_*.json /tmp/ct_all_names_$$.txt 2>/dev/null || true
+    [ ${#_CLEANUP_FILES[@]} -gt 0 ] && rm -f "${_CLEANUP_FILES[@]}" 2>/dev/null || true
+    _CLEANUP_FILES=()
     printf "\r%80s\r" "" >&2
     log_warn "Interruption détectée. Fichiers temporaires nettoyés."
 }
