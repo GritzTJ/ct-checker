@@ -14,7 +14,7 @@ set -uo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.0.2"
+readonly SCRIPT_VERSION="1.0.3"
 readonly CRT_SH_API="https://crt.sh"
 
 # ---------------------------------------------------------------------------
@@ -33,6 +33,8 @@ fi
 DOMAIN=""
 OUTPUT_DIR=""
 VERBOSE=false
+STDOUT_MODE=""          # "" = normal, "f" = FQDNs/wildcards, "4" = IPv4 only, "6" = IPv6 only
+STDOUT_TMPDIR=""        # tmpdir pour les modes stdout (nettoyé par trap EXIT)
 DNS_TOOL=""
 OS_NAME="unknown"
 PKG_MANAGER=""
@@ -60,12 +62,18 @@ ${BOLD}USAGE:${NC}
 ${BOLD}OPTIONS:${NC}
     -d DOMAINE      Domaine cible (FQDN)                    [obligatoire]
     -o DOSSIER      Dossier de sortie (défaut: ./<domaine>)
+    -f              Afficher uniquement les FQDNs et wildcards (pas de fichiers)
+    -4              Afficher uniquement les IPv4 uniques (pas de fichiers)
+    -6              Afficher uniquement les IPv6 uniques (pas de fichiers)
     -v              Mode verbeux
     -h              Afficher cette aide
 
 ${BOLD}EXEMPLES:${NC}
     $0 -d example.com
     $0 -d example.com -o /tmp/resultats -v
+    $0 -d example.com -f
+    $0 -d example.com -4
+    $0 -d example.com -6
 
 ${BOLD}FICHIERS DE SORTIE:${NC}
     <dossier>/<domaine>_<timestamp>/
@@ -629,10 +637,13 @@ EOF
 parse_args() {
     [ $# -eq 0 ] && usage
 
-    while getopts "d:o:vh" opt; do
+    while getopts "d:o:f46vh" opt; do
         case $opt in
             d) DOMAIN="$OPTARG" ;;
             o) OUTPUT_DIR="$OPTARG" ;;
+            f) STDOUT_MODE="f" ;;
+            4) STDOUT_MODE="4" ;;
+            6) STDOUT_MODE="6" ;;
             v) VERBOSE=true ;;
             h) usage ;;
             *) usage ;;
@@ -667,6 +678,61 @@ trap cleanup INT TERM
 # ---------------------------------------------------------------------------
 main() {
     parse_args "$@"
+
+    # --- Mode stdout (-f / -4 / -6) : tout dans un tmpdir, affichage sur stdout ---
+    if [ -n "$STDOUT_MODE" ]; then
+        STDOUT_TMPDIR=$(mktemp -d /tmp/ct_checker_XXXXXX)
+        trap 'rm -rf "$STDOUT_TMPDIR"' EXIT
+        local tmpdir="$STDOUT_TMPDIR"
+
+        detect_os
+        check_dependencies
+
+        log_info "Domaine cible : ${BOLD}${DOMAIN}${NC}" >&2
+        case "$STDOUT_MODE" in
+            f) log_info "Mode : FQDNs et wildcards uniquement (pas de fichiers sur disque)" >&2 ;;
+            *) log_info "Mode : IPv${STDOUT_MODE} uniquement (pas de fichiers sur disque)" >&2 ;;
+        esac
+
+        # Étape 1 : CT logs
+        local raw_ct_file="${tmpdir}/raw_ct_logs.json"
+        query_ct_logs "$DOMAIN" "$raw_ct_file"
+
+        # Étape 2 : extraction FQDNs
+        local all_fqdns_file="${tmpdir}/all_fqdns.txt"
+        local wildcards_file="${tmpdir}/wildcards.txt"
+        extract_fqdns "$raw_ct_file" "$all_fqdns_file" "$wildcards_file" "${tmpdir}/emails.txt"
+
+        if [ "$STDOUT_MODE" = "f" ]; then
+            # Afficher FQDNs et wildcards sur stdout
+            [ -f "$all_fqdns_file" ] && cat "$all_fqdns_file"
+            [ -f "$wildcards_file" ] && cat "$wildcards_file"
+            return 0
+        fi
+
+        local fqdn_count
+        fqdn_count=$(wc -l < "$all_fqdns_file" | tr -d ' ')
+        log_info "${fqdn_count} FQDNs à vérifier" >&2
+
+        # Étape 3 : vérification DNS
+        local dns_resolved_file="${tmpdir}/dns_resolved.txt"
+        verify_dns "$all_fqdns_file" "$dns_resolved_file" "${tmpdir}/dns_unresolved.txt" > /dev/null
+
+        # Étape 4 : extraction et affichage des IPs
+        if [ -f "$dns_resolved_file" ]; then
+            if [ "$STDOUT_MODE" = "4" ]; then
+                awk -F '|' 'NR>5 { gsub(/^ +| +$/, "", $2); if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $2 }' \
+                    "$dns_resolved_file" | sort -u
+            else
+                awk -F '|' 'NR>5 { gsub(/^ +| +$/, "", $3); if ($3 ~ /^[0-9a-fA-F:]+$/) print $3 }' \
+                    "$dns_resolved_file" | sort -u
+            fi
+        fi
+
+        return 0
+    fi
+
+    # --- Mode normal : écriture de tous les fichiers ---
 
     # Dossier de sortie par défaut = nom du domaine si -o non fourni
     [ -z "$OUTPUT_DIR" ] && OUTPUT_DIR="./${DOMAIN}"

@@ -28,6 +28,7 @@ Il est conçu pour fonctionner sur **n'importe quelle distribution GNU/Linux** e
 - Isole les **adresses e-mail** (SANs de type `rfc822Name`) dans un fichier séparé (non soumises à la vérification DNS)
 - Vérifie la **résolution DNS** (enregistrements A, AAAA, CNAME) pour chaque FQDN
 - Extrait les **adresses IPv4 et IPv6 uniques** dans des fichiers séparés
+- Modes **stdout** (`-f`, `-4`, `-6`) : affiche les FQDNs/wildcards ou les IPs uniques sans écrire de fichiers sur disque
 - Ne crée les fichiers de résultats **que s'ils contiennent des données** (aucun fichier vide)
 - Génère un **rapport de synthèse** horodaté
 - **Détecte automatiquement** la distribution et installe les dépendances manquantes
@@ -70,6 +71,9 @@ chmod +x ct-checker.sh
 |---|---|---|---|
 | `-d` | `DOMAINE` | **Oui** | FQDN cible à analyser |
 | `-o` | `DOSSIER` | Non | Dossier de sortie (défaut : `./<domaine>`) |
+| `-f` | — | Non | Afficher uniquement les FQDNs et wildcards sur stdout (pas de fichiers) |
+| `-4` | — | Non | Afficher uniquement les adresses IPv4 uniques sur stdout (pas de fichiers) |
+| `-6` | — | Non | Afficher uniquement les adresses IPv6 uniques sur stdout (pas de fichiers) |
 | `-v` | — | Non | Mode verbeux (détails des requêtes) |
 | `-h` | — | Non | Afficher l'aide |
 
@@ -84,6 +88,15 @@ chmod +x ct-checker.sh
 
 # Mode verbeux
 ./ct-checker.sh -d example.com -v
+
+# FQDNs et wildcards uniquement (stdout)
+./ct-checker.sh -d example.com -f
+
+# Adresses IPv4 uniques uniquement (stdout)
+./ct-checker.sh -d example.com -4
+
+# Adresses IPv6 uniques uniquement (stdout)
+./ct-checker.sh -d example.com -6
 ```
 
 ### Fichiers générés
@@ -138,6 +151,7 @@ It is designed to run on **any GNU/Linux distribution** and automatically instal
 - Isolates **email addresses** (`rfc822Name` SANs) into a separate file (excluded from DNS verification)
 - Verifies **DNS resolution** (A, AAAA, CNAME records) for each FQDN
 - Extracts **unique IPv4 and IPv6 addresses** into separate files
+- **Stdout modes** (`-f`, `-4`, `-6`): display FQDNs/wildcards or unique IPs without writing files to disk
 - Only creates result files **if they contain data** (no empty files)
 - Generates a **timestamped summary report**
 - **Automatically detects** the Linux distribution and installs missing dependencies
@@ -180,6 +194,9 @@ chmod +x ct-checker.sh
 |---|---|---|---|
 | `-d` | `DOMAIN` | **Yes** | Target FQDN to analyse |
 | `-o` | `DIR` | No | Output directory (default: `./<domain>`) |
+| `-f` | — | No | Display only FQDNs and wildcards on stdout (no files written) |
+| `-4` | — | No | Display only unique IPv4 addresses on stdout (no files written) |
+| `-6` | — | No | Display only unique IPv6 addresses on stdout (no files written) |
 | `-v` | — | No | Verbose mode (query details) |
 | `-h` | — | No | Show help |
 
@@ -194,6 +211,15 @@ chmod +x ct-checker.sh
 
 # Verbose mode
 ./ct-checker.sh -d example.com -v
+
+# FQDNs and wildcards only (stdout)
+./ct-checker.sh -d example.com -f
+
+# Unique IPv4 addresses only (stdout)
+./ct-checker.sh -d example.com -4
+
+# Unique IPv6 addresses only (stdout)
+./ct-checker.sh -d example.com -6
 ```
 
 ### Output Files
