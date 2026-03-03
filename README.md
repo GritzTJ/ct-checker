@@ -27,6 +27,7 @@ Il est conçu pour fonctionner sur **n'importe quelle distribution GNU/Linux** e
 - Isole les **wildcards** (`*.domain.com`) dans un fichier séparé (non soumis à la vérification DNS)
 - Isole les **adresses e-mail** (SANs de type `rfc822Name`) dans un fichier séparé (non soumises à la vérification DNS)
 - Vérifie la **résolution DNS** (enregistrements A, AAAA, CNAME) pour chaque FQDN
+- Extrait les **adresses IPv4 et IPv6 uniques** dans des fichiers séparés
 - Ne crée les fichiers de résultats **que s'ils contiennent des données** (aucun fichier vide)
 - Génère un **rapport de synthèse** horodaté
 - **Détecte automatiquement** la distribution et installe les dépendances manquantes
@@ -98,10 +99,12 @@ Les résultats sont organisés par domaine et horodatés pour conserver l'histor
     ├── emails.txt            Adresses e-mail extraites des SANs (si présentes)
     ├── dns_resolved.txt      FQDNs avec enregistrement DNS valide
     ├── dns_unresolved.txt    FQDNs sans enregistrement DNS (si présents)
+    ├── ipv4_unique.txt       Adresses IPv4 uniques (si présentes)
+    ├── ipv6_unique.txt       Adresses IPv6 uniques (si présentes)
     └── summary.txt           Rapport de synthèse
 ```
 
-> `wildcards.txt`, `emails.txt` et `dns_unresolved.txt` ne sont créés que s'ils contiennent des données.
+> `wildcards.txt`, `emails.txt`, `dns_unresolved.txt`, `ipv4_unique.txt` et `ipv6_unique.txt` ne sont créés que s'ils contiennent des données.
 
 ### Sources CT Logs
 
@@ -134,6 +137,7 @@ It is designed to run on **any GNU/Linux distribution** and automatically instal
 - Isolates **wildcards** (`*.domain.com`) into a separate file (excluded from DNS verification)
 - Isolates **email addresses** (`rfc822Name` SANs) into a separate file (excluded from DNS verification)
 - Verifies **DNS resolution** (A, AAAA, CNAME records) for each FQDN
+- Extracts **unique IPv4 and IPv6 addresses** into separate files
 - Only creates result files **if they contain data** (no empty files)
 - Generates a **timestamped summary report**
 - **Automatically detects** the Linux distribution and installs missing dependencies
@@ -205,10 +209,12 @@ Results are organised by domain and timestamped to preserve the history of analy
     ├── emails.txt            Email addresses extracted from SANs (if any)
     ├── dns_resolved.txt      FQDNs with a valid DNS record
     ├── dns_unresolved.txt    FQDNs with no DNS record (if any)
+    ├── ipv4_unique.txt       Unique IPv4 addresses (if any)
+    ├── ipv6_unique.txt       Unique IPv6 addresses (if any)
     └── summary.txt           Summary report
 ```
 
-> `wildcards.txt`, `emails.txt` and `dns_unresolved.txt` are only created if they contain data.
+> `wildcards.txt`, `emails.txt`, `dns_unresolved.txt`, `ipv4_unique.txt` and `ipv6_unique.txt` are only created if they contain data.
 
 ### CT Log Sources
 

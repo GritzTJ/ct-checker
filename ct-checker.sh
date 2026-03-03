@@ -14,7 +14,7 @@ set -uo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.0.1"
+readonly SCRIPT_VERSION="1.0.2"
 readonly CRT_SH_API="https://crt.sh"
 
 # ---------------------------------------------------------------------------
@@ -347,25 +347,41 @@ extract_fqdns() {
 # Retourne les enregistrements DNS séparés par des virgules, ou chaîne vide
 _resolve_dig() {
     local fqdn="$1" type="$2"
-    dig +short +timeout=5 +tries=2 "$type" "$fqdn" 2>/dev/null \
-        | grep -v '^;' | grep -v '^$' \
-        | tr '\n' ',' | sed 's/,$//'
+    local raw
+    raw=$(dig +short +timeout=5 +tries=2 "$type" "$fqdn" 2>/dev/null \
+        | grep -v '^;' | grep -v '^$')
+    # Pour A et AAAA, ne garder que les adresses IP (exclure les CNAME intermédiaires)
+    case "$type" in
+        A)    raw=$(echo "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') ;;
+        AAAA) raw=$(echo "$raw" | grep -E '^[0-9a-fA-F:]+$') ;;
+    esac
+    echo "$raw" | grep -v '^$' | tr '\n' ',' | sed 's/,$//'
 }
 
 _resolve_nslookup() {
     local fqdn="$1" type="$2"
-    nslookup -type="$type" -timeout=5 "$fqdn" 2>/dev/null \
+    local raw
+    raw=$(nslookup -type="$type" -timeout=5 "$fqdn" 2>/dev/null \
         | grep -Ev '^(Server|Address|$|;)' \
-        | awk '/^[^*]/ {print $NF}' \
-        | tr '\n' ',' | sed 's/,$//'
+        | awk '/^[^*]/ {print $NF}')
+    case "$type" in
+        A)    raw=$(echo "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') ;;
+        AAAA) raw=$(echo "$raw" | grep -E '^[0-9a-fA-F:]+$') ;;
+    esac
+    echo "$raw" | grep -v '^$' | tr '\n' ',' | sed 's/,$//'
 }
 
 _resolve_host() {
     local fqdn="$1" type="$2"
-    host -t "$type" -W 5 "$fqdn" 2>/dev/null \
+    local raw
+    raw=$(host -t "$type" -W 5 "$fqdn" 2>/dev/null \
         | grep -iv 'nxdomain\|not found\|servfail\|timed out' \
-        | awk '{print $NF}' \
-        | tr '\n' ',' | sed 's/,$//'
+        | awk '{print $NF}')
+    case "$type" in
+        A)    raw=$(echo "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') ;;
+        AAAA) raw=$(echo "$raw" | grep -E '^[0-9a-fA-F:]+$') ;;
+    esac
+    echo "$raw" | grep -v '^$' | tr '\n' ',' | sed 's/,$//'
 }
 
 # Effectue la vérification DNS d'un FQDN
@@ -432,18 +448,43 @@ verify_dns() {
         local is_resolved a_recs aaaa_recs cname_rec
         IFS='|' read -r is_resolved a_recs aaaa_recs cname_rec <<< "$result"
 
-        local line
-        printf -v line "%-60s | %-35s | %-40s | %s" \
-            "$fqdn" \
-            "${a_recs:-N/A}" \
-            "${aaaa_recs:-N/A}" \
-            "${cname_rec:-N/A}"
+        # --- Construire les lignes (multi-ligne si plusieurs IPs) ---
+        local -a a_arr=() aaaa_arr=()
+        [ -n "$a_recs" ] && IFS=',' read -ra a_arr <<< "$a_recs"
+        [ -n "$aaaa_recs" ] && IFS=',' read -ra aaaa_arr <<< "$aaaa_recs"
 
+        local max_lines=${#a_arr[@]}
+        [ ${#aaaa_arr[@]} -gt "$max_lines" ] && max_lines=${#aaaa_arr[@]}
+        [ "$max_lines" -eq 0 ] && max_lines=1
+
+        local line
         if [ "$is_resolved" = "true" ]; then
             resolved_count=$((resolved_count + 1))
+            # Première ligne : FQDN + première IP de chaque type + CNAME
+            printf -v line "%-60s | %-35s | %-40s | %s" \
+                "$fqdn" \
+                "${a_arr[0]:-N/A}" \
+                "${aaaa_arr[0]:-N/A}" \
+                "${cname_rec:-N/A}"
             echo "$line" >> "$tmp_resolved"
+            # Lignes suivantes : IPs supplémentaires (colonnes FQDN et CNAME vides)
+            local i
+            for ((i=1; i<max_lines; i++)); do
+                printf -v line "%-60s | %-35s | %-40s |" \
+                    "" \
+                    "${a_arr[$i]:-}" \
+                    "${aaaa_arr[$i]:-}"
+                echo "$line" >> "$tmp_resolved"
+            done
+            # Séparateur horizontal si le FQDN avait plusieurs lignes
+            if [ "$max_lines" -gt 1 ]; then
+                printf '%0.s-' {1..155} >> "$tmp_resolved"
+                echo "" >> "$tmp_resolved"
+            fi
         else
             unresolved_count=$((unresolved_count + 1))
+            printf -v line "%-60s | %-35s | %-40s | %s" \
+                "$fqdn" "N/A" "N/A" "N/A"
             echo "$line" >> "$tmp_unresolved"
         fi
 
@@ -531,13 +572,13 @@ generate_summary() {
     # on l'ajoute manuellement pour éviter l'affichage "0 octet").
     # Utilisation de printf -v pour préserver les sauts de ligne ($() les supprimerait).
     local file_list="" _entry
-    local _known_files=(raw_ct_logs.json all_fqdns.txt wildcards.txt emails.txt dns_resolved.txt dns_unresolved.txt)
+    local _known_files=(raw_ct_logs.json all_fqdns.txt wildcards.txt emails.txt dns_resolved.txt dns_unresolved.txt ipv4_unique.txt ipv6_unique.txt)
     for _f in "${_known_files[@]}"; do
         local _fp="${run_dir}/${_f}"
         if [ -f "$_fp" ]; then
-            local _sz
-            _sz=$(du -sh "$_fp" 2>/dev/null | cut -f1)
-            printf -v _entry "  %-38s %s\n" "$_f" "$_sz"
+            local _lc
+            _lc=$(grep -c . "$_fp" 2>/dev/null || echo 0)
+            printf -v _entry "  %-38s %s lignes\n" "$_f" "$_lc"
             file_list+="$_entry"
         fi
     done
@@ -549,23 +590,15 @@ generate_summary() {
   RAPPORT - Certificate Transparency Log Checker v${SCRIPT_VERSION}
 ================================================================================
   Domaine cible  : $domain
-  Date           : $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+  Date           : $(date '+%Y-%m-%d %H:%M:%S')
   OS             : ${OS_NAME}
   Outil DNS      : ${DNS_TOOL}
   Dossier        : ${run_dir}
 ================================================================================
 
-  SOURCE CT LOGS
-  --------------
-  Fournisseur    : crt.sh (agrégateur de tous les CT logs publics)
-  Logs couverts  : Google Argon/Xenon, DigiCert Yeti, Cloudflare Nimbus,
-                   Sectigo, Let's Encrypt Oak, Trust Asia, etc.
-  Certificats    : ${cert_count} entrées trouvées
-
-================================================================================
-
-  RÉSULTATS FQDNs
-  ---------------
+  RÉSULTATS
+  ---------
+  Certificats    : ${cert_count} entrées trouvées dans les CT logs
   FQDNs uniques  : ${fqdn_count} (wildcards et e-mails exclus)
 ${wildcard_line}
 ${email_line}
@@ -668,6 +701,8 @@ main() {
     local emails_file="${run_dir}/emails.txt"
     local dns_resolved_file="${run_dir}/dns_resolved.txt"
     local dns_unresolved_file="${run_dir}/dns_unresolved.txt"
+    local ipv4_file="${run_dir}/ipv4_unique.txt"
+    local ipv6_file="${run_dir}/ipv6_unique.txt"
     local summary_file="${run_dir}/summary.txt"
 
     # -------------------------------------------------------------------------
@@ -693,6 +728,22 @@ main() {
     echo "${BOLD}━━━ ÉTAPE 3/4 : Vérification DNS ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     local dns_stats
     dns_stats=$(verify_dns "$all_fqdns_file" "$dns_resolved_file" "$dns_unresolved_file")
+
+    # Extraction des adresses IP uniques depuis dns_resolved.txt
+    local ipv4_count=0 ipv6_count=0
+    if [ -f "$dns_resolved_file" ]; then
+        # Colonne A (IPv4) : champ 2 après le premier |
+        # Colonne AAAA (IPv6) : champ 3 après le deuxième |
+        awk -F '|' 'NR>5 { gsub(/^ +| +$/, "", $2); if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $2 }' \
+            "$dns_resolved_file" | sort -u > "$ipv4_file"
+        awk -F '|' 'NR>5 { gsub(/^ +| +$/, "", $3); if ($3 ~ /^[0-9a-fA-F:]+$/) print $3 }' \
+            "$dns_resolved_file" | sort -u > "$ipv6_file"
+        # Supprimer si vide
+        [ -s "$ipv4_file" ] && ipv4_count=$(wc -l < "$ipv4_file" | tr -d ' ') || rm -f "$ipv4_file"
+        [ -s "$ipv6_file" ] && ipv6_count=$(wc -l < "$ipv6_file" | tr -d ' ') || rm -f "$ipv6_file"
+        [ "$ipv4_count" -gt 0 ] && log_success "${ipv4_count} adresses IPv4 uniques extraites"
+        [ "$ipv6_count" -gt 0 ] && log_success "${ipv6_count} adresses IPv6 uniques extraites"
+    fi
 
     # -------------------------------------------------------------------------
     echo ""
