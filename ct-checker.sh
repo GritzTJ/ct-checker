@@ -14,7 +14,7 @@ set -euo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.1"
 readonly CRT_SH_API="https://crt.sh"
 
 # ---------------------------------------------------------------------------
@@ -265,18 +265,24 @@ query_ct_logs() {
 
     log_info "Interrogation des CT logs via crt.sh..."
     log_info "Agrège : Google, DigiCert, Cloudflare Nimbus, Sectigo, Let's Encrypt, etc."
+    log_info "(crt.sh peut être lent ou indisponible — patience, max ~60s par requête)"
 
     local tmp1 tmp2
     tmp1=$(mktemp -t ct_check.XXXXXX)
     tmp2=$(mktemp -t ct_check.XXXXXX)
     _CLEANUP_FILES+=("$tmp1" "$tmp2")
 
+    # Timeouts plus serrés pour éviter d'attendre 3+ minutes quand crt.sh
+    # rame ou renvoie des 5xx : 1ère tentative 45s, 1 retry, ~60s max au total.
+    local -a curl_opts=(
+        -s --max-time 45 --retry 1 --retry-delay 3 --retry-max-time 60
+        -H "Accept: application/json"
+    )
+
     # Requête 1 : sous-domaines (%.domain.com)
-    log_debug "Requête 1 : sous-domaines (%.${domain})"
+    log_info "Requête 1/2 : sous-domaines (%.${domain})..."
     local resp_code1 resp_code2
-    resp_code1=$(curl -s -o "$tmp1" -w "%{http_code}" \
-        --max-time 90 --retry 3 --retry-delay 5 --retry-max-time 120 \
-        -H "Accept: application/json" \
+    resp_code1=$(curl "${curl_opts[@]}" -o "$tmp1" -w "%{http_code}" \
         "${CRT_SH_API}/?q=%25.${domain}&output=json" 2>/dev/null) || resp_code1="000"
 
     if [ "$resp_code1" != "200" ]; then
@@ -284,10 +290,8 @@ query_ct_logs() {
     fi
 
     # Requête 2 : domaine exact
-    log_debug "Requête 2 : domaine exact (${domain})"
-    resp_code2=$(curl -s -o "$tmp2" -w "%{http_code}" \
-        --max-time 90 --retry 3 --retry-delay 5 --retry-max-time 120 \
-        -H "Accept: application/json" \
+    log_info "Requête 2/2 : domaine exact (${domain})..."
+    resp_code2=$(curl "${curl_opts[@]}" -o "$tmp2" -w "%{http_code}" \
         "${CRT_SH_API}/?q=${domain}&output=json" 2>/dev/null) || resp_code2="000"
 
     if [ "$resp_code2" != "200" ]; then
@@ -300,7 +304,16 @@ query_ct_logs() {
     if jq -e 'if type == "array" then . else error end' "$tmp2" &>/dev/null; then valid2=true; fi
 
     if ! $valid1 && ! $valid2; then
-        log_error "Aucune réponse JSON valide depuis crt.sh. Vérifiez votre connexion internet."
+        log_error "Aucune réponse JSON valide depuis crt.sh."
+        # Aide au diagnostic : on distingue panne crt.sh (5xx) vs autre problème
+        if [[ "$resp_code1" =~ ^5 ]] || [[ "$resp_code2" =~ ^5 ]]; then
+            log_error "crt.sh semble en panne (HTTP 5xx). Réessayez dans quelques minutes."
+            log_error "Status : https://crt.sh/  ou  https://groups.google.com/g/crtsh"
+        elif [ "$resp_code1" = "000" ] && [ "$resp_code2" = "000" ]; then
+            log_error "Aucune réponse réseau. Vérifiez votre connexion internet."
+        else
+            log_error "Codes HTTP reçus : ${resp_code1} / ${resp_code2}"
+        fi
         rm -f "$tmp1" "$tmp2"
         exit 1
     fi
@@ -710,14 +723,23 @@ parse_args() {
 # Nettoyage en cas d'interruption
 # ---------------------------------------------------------------------------
 cleanup() {
+    local sig="${1:-INT}"
     if [ ${#_CLEANUP_FILES[@]} -gt 0 ]; then
         rm -f "${_CLEANUP_FILES[@]}" 2>/dev/null || true
     fi
     _CLEANUP_FILES=()
     printf "\r%80s\r" "" >&2
     log_warn "Interruption détectée. Fichiers temporaires nettoyés."
+    # Le trap par défaut continue l'exécution après le handler ; on doit donc
+    # forcer un exit ici, sinon le script poursuit avec un état incohérent
+    # (curl interrompu, fichiers temp absents, etc.).
+    case "$sig" in
+        TERM) exit 143 ;;
+        *)    exit 130 ;;
+    esac
 }
-trap cleanup INT TERM
+trap 'cleanup INT'  INT
+trap 'cleanup TERM' TERM
 
 # ---------------------------------------------------------------------------
 # Point d'entrée principal
