@@ -8,13 +8,13 @@
 # Usage: ./ct-checker.sh -d example.com [-o /chemin/resultats] [-v]
 # =============================================================================
 
-set -uo pipefail
+set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.0.3"
+readonly SCRIPT_VERSION="1.1.0"
 readonly CRT_SH_API="https://crt.sh"
 
 # ---------------------------------------------------------------------------
@@ -36,6 +36,7 @@ VERBOSE=false
 STDOUT_MODE=""          # "" = normal, "f" = FQDNs/wildcards, "4" = IPv4 only, "6" = IPv6 only
 STDOUT_TMPDIR=""        # tmpdir pour les modes stdout (nettoyé par trap EXIT)
 DNS_TOOL=""
+DNS_PARALLEL="${DNS_PARALLEL:-10}"   # nombre de résolutions DNS en parallèle (surchargeable via env ou -j)
 OS_NAME="unknown"
 PKG_MANAGER=""
 _CLEANUP_FILES=()         # fichiers temporaires à supprimer en cas d'interruption
@@ -43,11 +44,13 @@ _CLEANUP_FILES=()         # fichiers temporaires à supprimer en cas d'interrupt
 # ---------------------------------------------------------------------------
 # Fonctions de log
 # ---------------------------------------------------------------------------
-log_info()    { echo "${BLUE}[*]${NC} $*"; }
-log_success() { echo "${GREEN}[+]${NC} $*"; }
-log_warn()    { echo "${YELLOW}[!]${NC} $*"; }
+# Tous les logs vont sur stderr — stdout est réservé aux données du script
+# (FQDNs, IPs en modes -f/-4/-6, ou rien en mode normal).
+log_info()    { echo "${BLUE}[*]${NC} $*" >&2; }
+log_success() { echo "${GREEN}[+]${NC} $*" >&2; }
+log_warn()    { echo "${YELLOW}[!]${NC} $*" >&2; }
 log_error()   { echo "${RED}[-]${NC} $*" >&2; }
-log_debug()   { $VERBOSE && echo "${CYAN}[D]${NC} $*" || true; }
+log_debug()   { if $VERBOSE; then echo "${CYAN}[D]${NC} $*" >&2; fi; }
 
 # ---------------------------------------------------------------------------
 # Usage
@@ -63,6 +66,7 @@ ${BOLD}USAGE:${NC}
 ${BOLD}OPTIONS:${NC}
     -d DOMAINE      Domaine cible (FQDN)                    [obligatoire]
     -o DOSSIER      Dossier de sortie (défaut: ./<domaine>)
+    -j N            Résolutions DNS en parallèle (défaut: 10)
     -f              Afficher uniquement les FQDNs et wildcards (pas de fichiers)
     -4              Afficher uniquement les IPv4 uniques (pas de fichiers)
     -6              Afficher uniquement les IPv6 uniques (pas de fichiers)
@@ -72,6 +76,7 @@ ${BOLD}OPTIONS:${NC}
 ${BOLD}EXEMPLES:${NC}
     $0 -d example.com
     $0 -d example.com -o /tmp/resultats -v
+    $0 -d example.com -j 20
     $0 -d example.com -f
     $0 -d example.com -4
     $0 -d example.com -6
@@ -156,6 +161,12 @@ install_package() {
 }
 
 check_dependencies() {
+    # En mode -f, on n'utilise pas le DNS : pas besoin d'installer dig.
+    local need_dns=true
+    if [ "$STDOUT_MODE" = "f" ]; then
+        need_dns=false
+    fi
+
     log_info "Vérification des dépendances..."
 
     local missing_tools=()
@@ -167,19 +178,27 @@ check_dependencies() {
         fi
     done
 
-    # Cherche le premier outil DNS disponible
-    DNS_TOOL=""
-    for tool in "${dns_tools[@]}"; do
-        if command -v "$tool" &>/dev/null; then
-            DNS_TOOL="$tool"
-            break
-        fi
-    done
+    if $need_dns; then
+        # Préférence : dig > nslookup > host (dig est le plus fiable)
+        DNS_TOOL=""
+        for tool in "${dns_tools[@]}"; do
+            if command -v "$tool" &>/dev/null; then
+                DNS_TOOL="$tool"
+                break
+            fi
+        done
 
-    [ -z "$DNS_TOOL" ] && missing_tools+=("dig")
+        if [ -z "$DNS_TOOL" ]; then
+            missing_tools+=("dig")
+        fi
+    fi
 
     if [ ${#missing_tools[@]} -eq 0 ]; then
-        log_success "Dépendances OK (outil DNS : $DNS_TOOL)"
+        if $need_dns; then
+            log_success "Dépendances OK (outil DNS : $DNS_TOOL)"
+        else
+            log_success "Dépendances OK"
+        fi
         return 0
     fi
 
@@ -229,8 +248,8 @@ check_dependencies() {
         log_success "$tool installé avec succès"
     done
 
-    # Réinitialise DNS_TOOL si dig vient d'être installé
-    if [ -z "$DNS_TOOL" ] && command -v dig &>/dev/null; then
+    # Préfère dig dès qu'il est dispo (même si nslookup/host était déjà présent)
+    if $need_dns && command -v dig &>/dev/null; then
         DNS_TOOL="dig"
     fi
 
@@ -248,33 +267,37 @@ query_ct_logs() {
     log_info "Agrège : Google, DigiCert, Cloudflare Nimbus, Sectigo, Let's Encrypt, etc."
 
     local tmp1 tmp2
-    tmp1=$(mktemp /tmp/ct_check_XXXXXX.json)
-    tmp2=$(mktemp /tmp/ct_check_XXXXXX.json)
+    tmp1=$(mktemp -t ct_check.XXXXXX)
+    tmp2=$(mktemp -t ct_check.XXXXXX)
     _CLEANUP_FILES+=("$tmp1" "$tmp2")
 
     # Requête 1 : sous-domaines (%.domain.com)
     log_debug "Requête 1 : sous-domaines (%.${domain})"
-    local resp_code
-    resp_code=$(curl -s -o "$tmp1" -w "%{http_code}" \
+    local resp_code1 resp_code2
+    resp_code1=$(curl -s -o "$tmp1" -w "%{http_code}" \
         --max-time 90 --retry 3 --retry-delay 5 --retry-max-time 120 \
         -H "Accept: application/json" \
-        "${CRT_SH_API}/?q=%25.${domain}&output=json" 2>/dev/null) || true
+        "${CRT_SH_API}/?q=%25.${domain}&output=json" 2>/dev/null) || resp_code1="000"
 
-    if [ "$resp_code" != "200" ]; then
-        log_warn "crt.sh a retourné HTTP $resp_code pour la requête sous-domaines"
+    if [ "$resp_code1" != "200" ]; then
+        log_warn "crt.sh a retourné HTTP $resp_code1 pour la requête sous-domaines"
     fi
 
     # Requête 2 : domaine exact
     log_debug "Requête 2 : domaine exact (${domain})"
-    curl -s -o "$tmp2" \
+    resp_code2=$(curl -s -o "$tmp2" -w "%{http_code}" \
         --max-time 90 --retry 3 --retry-delay 5 --retry-max-time 120 \
         -H "Accept: application/json" \
-        "${CRT_SH_API}/?q=${domain}&output=json" 2>/dev/null || true
+        "${CRT_SH_API}/?q=${domain}&output=json" 2>/dev/null) || resp_code2="000"
+
+    if [ "$resp_code2" != "200" ]; then
+        log_warn "crt.sh a retourné HTTP $resp_code2 pour la requête domaine exact"
+    fi
 
     # Validation JSON et fusion
     local valid1=false valid2=false
-    jq -e 'if type == "array" then . else error end' "$tmp1" &>/dev/null && valid1=true
-    jq -e 'if type == "array" then . else error end' "$tmp2" &>/dev/null && valid2=true
+    if jq -e 'if type == "array" then . else error end' "$tmp1" &>/dev/null; then valid1=true; fi
+    if jq -e 'if type == "array" then . else error end' "$tmp2" &>/dev/null; then valid2=true; fi
 
     if ! $valid1 && ! $valid2; then
         log_error "Aucune réponse JSON valide depuis crt.sh. Vérifiez votre connexion internet."
@@ -309,26 +332,30 @@ extract_fqdns() {
 
     log_info "Extraction des FQDNs uniques depuis les données CT..."
 
-    # name_value peut contenir plusieurs SANs séparés par \n
-    # On extrait, on nettoie, on déduplique
+    # name_value contient les SANs séparés par \n ; jq -r restitue ces \n en newlines.
+    # On nettoie (trim, dédup) puis on classe en 3 catégories en une seule passe awk.
     local tmp_names
-    tmp_names=$(mktemp /tmp/ct_all_names_XXXXXX.txt)
+    tmp_names=$(mktemp -t ct_all_names.XXXXXX)
     _CLEANUP_FILES+=("$tmp_names")
 
     jq -r '.[].name_value' "$ct_file" \
-        | tr ',' '\n' \
-        | sed 's/^[[:space:]]*//' \
-        | sed 's/[[:space:]]*$//' \
-        | grep -v '^$' \
+        | awk '{ gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print }' \
         | sort -u > "$tmp_names"
 
-    # Séparation en trois catégories :
-    # 1. Adresses e-mail (contiennent @) — SANs de type rfc822Name
-    grep '@' "$tmp_names" > "$emails_file" 2>/dev/null || true
-    # 2. Wildcards (commencent par *.) — hors e-mails
-    grep -v '@' "$tmp_names" | grep '^\*\.' > "$wildcards_file" 2>/dev/null || true
-    # 3. FQDNs normaux — ni e-mail, ni wildcard
-    grep -v '@' "$tmp_names" | grep -v '^\*\.' > "$fqdns_file" 2>/dev/null || true
+    # Crée les fichiers (vides) pour que les wc/test ultérieurs ne plantent pas.
+    : > "$fqdns_file"
+    : > "$wildcards_file"
+    : > "$emails_file"
+
+    # Classement en une seule passe :
+    # - e-mails (contiennent @) — SANs de type rfc822Name
+    # - wildcards (^*.) — hors e-mails
+    # - FQDNs normaux — ni e-mail, ni wildcard
+    awk -v f_fqdn="$fqdns_file" -v f_wc="$wildcards_file" -v f_mail="$emails_file" '
+        /@/      { print > f_mail; next }
+        /^\*\./  { print > f_wc;   next }
+                 { print > f_fqdn }
+    ' "$tmp_names"
 
     rm -f "$tmp_names"
 
@@ -338,8 +365,8 @@ extract_fqdns() {
     email_count=$(wc -l < "$emails_file" | tr -d ' ')
 
     # Supprime les fichiers vides
-    [ "$wildcard_count" -eq 0 ] && rm -f "$wildcards_file"
-    [ "$email_count" -eq 0 ] && rm -f "$emails_file"
+    if [ "$wildcard_count" -eq 0 ]; then rm -f "$wildcards_file"; fi
+    if [ "$email_count" -eq 0 ];    then rm -f "$emails_file";    fi
 
     log_success "${fqdn_count} FQDNs uniques extraits"
     if [ "$wildcard_count" -gt 0 ]; then
@@ -358,44 +385,51 @@ extract_fqdns() {
 # Résolution DNS selon l'outil disponible
 # ---------------------------------------------------------------------------
 
-# Retourne les enregistrements DNS séparés par des virgules, ou chaîne vide
+# Regex IPv4 / IPv6 stricts. On utilise [.] plutôt que \. pour qu'awk ne râle pas
+# quand le pattern est passé via -v (où awk évalue les escapes).
+readonly RE_IPV4='^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$'
+readonly RE_IPV6='^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$'
+
+# Retourne les enregistrements DNS séparés par des virgules, ou chaîne vide.
+# Toutes les pipes utilisent || true pour rester compatibles avec set -e (grep
+# retourne 1 quand aucun match).
 _resolve_dig() {
     local fqdn="$1" type="$2"
     local raw
     raw=$(dig +short +timeout=5 +tries=2 "$type" "$fqdn" 2>/dev/null \
-        | grep -v '^;' | grep -v '^$')
+        | { grep -v '^;' || true; } | { grep -v '^$' || true; })
     # Pour A et AAAA, ne garder que les adresses IP (exclure les CNAME intermédiaires)
     case "$type" in
-        A)    raw=$(echo "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') ;;
-        AAAA) raw=$(echo "$raw" | grep -E '^[0-9a-fA-F:]+$') ;;
+        A)    raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
+        AAAA) raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
     esac
-    echo "$raw" | grep -v '^$' | tr '\n' ',' | sed 's/,$//'
+    echo "$raw" | { grep -v '^$' || true; } | tr '\n' ',' | sed 's/,$//'
 }
 
 _resolve_nslookup() {
     local fqdn="$1" type="$2"
     local raw
     raw=$(nslookup -type="$type" -timeout=5 "$fqdn" 2>/dev/null \
-        | grep -Ev '^(Server|Address|$|;)' \
+        | { grep -Ev '^(Server|Address|$|;)' || true; } \
         | awk '/^[^*]/ {print $NF}')
     case "$type" in
-        A)    raw=$(echo "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') ;;
-        AAAA) raw=$(echo "$raw" | grep -E '^[0-9a-fA-F:]+$') ;;
+        A)    raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
+        AAAA) raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
     esac
-    echo "$raw" | grep -v '^$' | tr '\n' ',' | sed 's/,$//'
+    echo "$raw" | { grep -v '^$' || true; } | tr '\n' ',' | sed 's/,$//'
 }
 
 _resolve_host() {
     local fqdn="$1" type="$2"
     local raw
     raw=$(host -t "$type" -W 5 "$fqdn" 2>/dev/null \
-        | grep -iv 'nxdomain\|not found\|servfail\|timed out' \
+        | { grep -iv 'nxdomain\|not found\|servfail\|timed out' || true; } \
         | awk '{print $NF}')
     case "$type" in
-        A)    raw=$(echo "$raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') ;;
-        AAAA) raw=$(echo "$raw" | grep -E '^[0-9a-fA-F:]+$') ;;
+        A)    raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
+        AAAA) raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
     esac
-    echo "$raw" | grep -v '^$' | tr '\n' ',' | sed 's/,$//'
+    echo "$raw" | { grep -v '^$' || true; } | tr '\n' ',' | sed 's/,$//'
 }
 
 # Effectue la vérification DNS d'un FQDN
@@ -423,13 +457,29 @@ check_dns() {
     esac
 
     local resolved=false
-    { [ -n "$a_records" ] || [ -n "$aaaa_records" ] || [ -n "$cname_record" ]; } && resolved=true
+    if [ -n "$a_records" ] || [ -n "$aaaa_records" ] || [ -n "$cname_record" ]; then
+        resolved=true
+    fi
 
     echo "${resolved}|${a_records}|${aaaa_records}|${cname_record}"
 }
 
 # ---------------------------------------------------------------------------
-# Boucle principale de vérification DNS
+# Worker DNS — appelé en parallèle via xargs.
+# Lit un FQDN en argument, écrit sur stdout :  status|fqdn|a_csv|aaaa_csv|cname
+# ---------------------------------------------------------------------------
+_dns_worker_csv() {
+    local fqdn="$1"
+    [ -z "$fqdn" ] && return 0
+    local result is_resolved a aaaa cname
+    result=$(check_dns "$fqdn")
+    IFS='|' read -r is_resolved a aaaa cname <<< "$result"
+    echo "${is_resolved}|${fqdn}|${a}|${aaaa}|${cname}"
+}
+
+# ---------------------------------------------------------------------------
+# Vérification DNS parallélisée (xargs -P)
+# Le rendu tabulaire multi-ligne est ensuite produit en une passe awk.
 # ---------------------------------------------------------------------------
 verify_dns() {
     local fqdns_file="$1"
@@ -438,82 +488,39 @@ verify_dns() {
 
     local total
     total=$(grep -c . "$fqdns_file" 2>/dev/null || echo 0)
-    local resolved_count=0
-    local unresolved_count=0
+    local parallel="${DNS_PARALLEL:-10}"
 
-    log_info "Vérification DNS de ${total} FQDNs (outil : ${DNS_TOOL})..." >&2
+    log_info "Vérification DNS de ${total} FQDNs (outil : ${DNS_TOOL}, parallélisme : ${parallel})..."
 
-    # Fichiers temporaires pour collecter les données avant d'écrire les fichiers finaux
-    local tmp_resolved tmp_unresolved
-    tmp_resolved=$(mktemp /tmp/ct_dns_res_XXXXXX.txt)
-    tmp_unresolved=$(mktemp /tmp/ct_dns_nores_XXXXXX.txt)
-    _CLEANUP_FILES+=("$tmp_resolved" "$tmp_unresolved")
+    # CSV intermédiaire — chaque worker imprime une ligne ; pour des lignes
+    # < PIPE_BUF (4 Ko) l'écriture est atomique sur Linux, pas besoin de lock.
+    local tmp_csv
+    tmp_csv=$(mktemp -t ct_dns_csv.XXXXXX)
+    _CLEANUP_FILES+=("$tmp_csv")
 
-    local current=0
-    while IFS= read -r fqdn; do
-        [ -z "$fqdn" ] && continue
-        current=$((current + 1))
+    # Variables et fonctions à propager aux sous-shells xargs
+    export DNS_TOOL RE_IPV4 RE_IPV6
+    export -f _resolve_dig _resolve_nslookup _resolve_host check_dns _dns_worker_csv
 
-        # Indicateur de progression sur stderr
-        printf "\r  [%d/%d] Vérification : %-50s" "$current" "$total" "$fqdn" >&2
+    if [ "$total" -gt 0 ]; then
+        # -P : parallélisme  -I {} : substitution (implique -n 1)
+        xargs -P "$parallel" -I {} bash -c '_dns_worker_csv "$@"' _ {} \
+            < "$fqdns_file" > "$tmp_csv"
+    fi
 
-        local result
-        result=$(check_dns "$fqdn")
+    # Compte les résultats
+    local resolved_count unresolved_count
+    resolved_count=$(awk -F'|' '$1=="true"'  "$tmp_csv" | wc -l | tr -d ' ')
+    unresolved_count=$(awk -F'|' '$1=="false"' "$tmp_csv" | wc -l | tr -d ' ')
 
-        local is_resolved a_recs aaaa_recs cname_rec
-        IFS='|' read -r is_resolved a_recs aaaa_recs cname_rec <<< "$result"
+    # Tri alphabétique par FQDN — rapport déterministe et lisible
+    sort -t'|' -k2,2 "$tmp_csv" -o "$tmp_csv"
 
-        # --- Construire les lignes (multi-ligne si plusieurs IPs) ---
-        local -a a_arr=() aaaa_arr=()
-        [ -n "$a_recs" ] && IFS=',' read -ra a_arr <<< "$a_recs"
-        [ -n "$aaaa_recs" ] && IFS=',' read -ra aaaa_arr <<< "$aaaa_recs"
-
-        local max_lines=${#a_arr[@]}
-        [ ${#aaaa_arr[@]} -gt "$max_lines" ] && max_lines=${#aaaa_arr[@]}
-        [ "$max_lines" -eq 0 ] && max_lines=1
-
-        local line
-        if [ "$is_resolved" = "true" ]; then
-            resolved_count=$((resolved_count + 1))
-            # Première ligne : FQDN + première IP de chaque type + CNAME
-            printf -v line "%-60s | %-35s | %-40s | %s" \
-                "$fqdn" \
-                "${a_arr[0]:-N/A}" \
-                "${aaaa_arr[0]:-N/A}" \
-                "${cname_rec:-N/A}"
-            echo "$line" >> "$tmp_resolved"
-            # Lignes suivantes : IPs supplémentaires (colonnes FQDN et CNAME vides)
-            local i
-            for ((i=1; i<max_lines; i++)); do
-                printf -v line "%-60s | %-35s | %-40s |" \
-                    "" \
-                    "${a_arr[$i]:-}" \
-                    "${aaaa_arr[$i]:-}"
-                echo "$line" >> "$tmp_resolved"
-            done
-            # Séparateur horizontal si le FQDN avait plusieurs lignes
-            if [ "$max_lines" -gt 1 ]; then
-                printf '%0.s-' {1..155} >> "$tmp_resolved"
-                echo "" >> "$tmp_resolved"
-            fi
-        else
-            unresolved_count=$((unresolved_count + 1))
-            printf -v line "%-60s | %-35s | %-40s | %s" \
-                "$fqdn" "N/A" "N/A" "N/A"
-            echo "$line" >> "$tmp_unresolved"
-        fi
-
-    done < "$fqdns_file"
-
-    # Efface la ligne de progression
-    printf "\r%80s\r" "" >&2
-
-    # En-tête commun pour les fichiers de résultats
+    # En-tête commun
     local header separator
     header=$(printf "%-60s | %-35s | %-40s | %s" "FQDN" "A (IPv4)" "AAAA (IPv6)" "CNAME")
     separator=$(printf '%0.s-' {1..155})
 
-    # N'écrit les fichiers finaux que s'ils contiennent des données
     if [ "$resolved_count" -gt 0 ]; then
         {
             echo "# DNS Verification Results (RESOLVED) - $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
@@ -521,7 +528,27 @@ verify_dns() {
             echo "$separator"
             echo "$header"
             echo "$separator"
-            cat "$tmp_resolved"
+            awk -F'|' -v sep="$separator" '
+                $1=="true" {
+                    fqdn=$2; a=$3; aaaa=$4; cname=$5
+                    n_a    = (a    == "") ? 0 : split(a,    a_arr,    ",")
+                    n_aaaa = (aaaa == "") ? 0 : split(aaaa, aaaa_arr, ",")
+                    max = (n_a > n_aaaa) ? n_a : n_aaaa
+                    if (max == 0) max = 1
+                    printf "%-60s | %-35s | %-40s | %s\n", \
+                        fqdn, \
+                        (n_a    > 0 ? a_arr[1]    : "N/A"), \
+                        (n_aaaa > 0 ? aaaa_arr[1] : "N/A"), \
+                        (cname != ""  ? cname     : "N/A")
+                    for (i = 2; i <= max; i++) {
+                        printf "%-60s | %-35s | %-40s |\n", \
+                            "", \
+                            (i <= n_a    ? a_arr[i]    : ""), \
+                            (i <= n_aaaa ? aaaa_arr[i] : "")
+                    }
+                    if (max > 1) print sep
+                }
+            ' "$tmp_csv"
         } > "$resolved_file"
     fi
 
@@ -532,13 +559,15 @@ verify_dns() {
             echo "$separator"
             echo "$header"
             echo "$separator"
-            cat "$tmp_unresolved"
+            awk -F'|' '$1=="false" {
+                printf "%-60s | %-35s | %-40s | %s\n", $2, "N/A", "N/A", "N/A"
+            }' "$tmp_csv"
         } > "$unresolved_file"
     fi
 
-    rm -f "$tmp_resolved" "$tmp_unresolved"
+    rm -f "$tmp_csv"
 
-    log_success "DNS : ${resolved_count} résolus, ${unresolved_count} non résolus (sur ${total})" >&2
+    log_success "DNS : ${resolved_count} résolus, ${unresolved_count} non résolus (sur ${total})"
 
     echo "${total}|${resolved_count}|${unresolved_count}"
 }
@@ -605,7 +634,7 @@ generate_summary() {
   RAPPORT - Certificate Transparency Log Checker v${SCRIPT_VERSION}
 ================================================================================
   Domaine cible  : $domain
-  Date           : $(date '+%Y-%m-%d %H:%M:%S')
+  Date           : $(date -u '+%Y-%m-%d %H:%M:%S UTC')
   OS             : ${OS_NAME}
   Outil DNS      : ${DNS_TOOL}
   Dossier        : ${run_dir}
@@ -644,10 +673,11 @@ EOF
 parse_args() {
     [ $# -eq 0 ] && usage
 
-    while getopts "d:o:f46vh" opt; do
+    while getopts "d:o:j:f46vh" opt; do
         case $opt in
             d) DOMAIN="$OPTARG" ;;
             o) OUTPUT_DIR="$OPTARG" ;;
+            j) DNS_PARALLEL="$OPTARG" ;;
             f) STDOUT_MODE="f" ;;
             4) STDOUT_MODE="4" ;;
             6) STDOUT_MODE="6" ;;
@@ -656,6 +686,12 @@ parse_args() {
             *) usage ;;
         esac
     done
+
+    # Valide DNS_PARALLEL
+    if ! [[ "$DNS_PARALLEL" =~ ^[0-9]+$ ]] || [ "$DNS_PARALLEL" -lt 1 ]; then
+        log_error "Le parallélisme (-j) doit être un entier ≥ 1 (reçu : $DNS_PARALLEL)"
+        exit 1
+    fi
 
     if [ -z "$DOMAIN" ]; then
         log_error "Le domaine (-d) est obligatoire."
@@ -674,7 +710,9 @@ parse_args() {
 # Nettoyage en cas d'interruption
 # ---------------------------------------------------------------------------
 cleanup() {
-    [ ${#_CLEANUP_FILES[@]} -gt 0 ] && rm -f "${_CLEANUP_FILES[@]}" 2>/dev/null || true
+    if [ ${#_CLEANUP_FILES[@]} -gt 0 ]; then
+        rm -f "${_CLEANUP_FILES[@]}" 2>/dev/null || true
+    fi
     _CLEANUP_FILES=()
     printf "\r%80s\r" "" >&2
     log_warn "Interruption détectée. Fichiers temporaires nettoyés."
@@ -689,17 +727,17 @@ main() {
 
     # --- Mode stdout (-f / -4 / -6) : tout dans un tmpdir, affichage sur stdout ---
     if [ -n "$STDOUT_MODE" ]; then
-        STDOUT_TMPDIR=$(mktemp -d /tmp/ct_checker_XXXXXX)
+        STDOUT_TMPDIR=$(mktemp -d -t ct_checker.XXXXXX)
         trap 'rm -rf "$STDOUT_TMPDIR"' EXIT
         local tmpdir="$STDOUT_TMPDIR"
 
         detect_os
         check_dependencies
 
-        log_info "Domaine cible : ${BOLD}${DOMAIN}${NC}" >&2
+        log_info "Domaine cible : ${BOLD}${DOMAIN}${NC}"
         case "$STDOUT_MODE" in
-            f) log_info "Mode : FQDNs et wildcards uniquement (pas de fichiers sur disque)" >&2 ;;
-            *) log_info "Mode : IPv${STDOUT_MODE} uniquement (pas de fichiers sur disque)" >&2 ;;
+            f) log_info "Mode : FQDNs et wildcards uniquement (pas de fichiers sur disque)" ;;
+            *) log_info "Mode : IPv${STDOUT_MODE} uniquement (pas de fichiers sur disque)" ;;
         esac
 
         # Étape 1 : CT logs
@@ -713,14 +751,14 @@ main() {
 
         if [ "$STDOUT_MODE" = "f" ]; then
             # Afficher FQDNs et wildcards sur stdout
-            [ -f "$all_fqdns_file" ] && cat "$all_fqdns_file"
-            [ -f "$wildcards_file" ] && cat "$wildcards_file"
+            if [ -f "$all_fqdns_file" ]; then cat "$all_fqdns_file"; fi
+            if [ -f "$wildcards_file" ]; then cat "$wildcards_file"; fi
             return 0
         fi
 
         local fqdn_count
         fqdn_count=$(wc -l < "$all_fqdns_file" | tr -d ' ')
-        log_info "${fqdn_count} FQDNs à vérifier" >&2
+        log_info "${fqdn_count} FQDNs à vérifier"
 
         # Étape 3 : vérification DNS
         local dns_resolved_file="${tmpdir}/dns_resolved.txt"
@@ -729,10 +767,10 @@ main() {
         # Étape 4 : extraction et affichage des IPs
         if [ -f "$dns_resolved_file" ]; then
             if [ "$STDOUT_MODE" = "4" ]; then
-                awk -F '|' 'NR>5 { gsub(/^ +| +$/, "", $2); if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $2 }' \
+                awk -F '|' -v re="$RE_IPV4" 'NR>5 { gsub(/^ +| +$/, "", $2); if ($2 ~ re) print $2 }' \
                     "$dns_resolved_file" | sort -u
             else
-                awk -F '|' 'NR>5 { gsub(/^ +| +$/, "", $3); if ($3 ~ /^[0-9a-fA-F:]+$/) print $3 }' \
+                awk -F '|' -v re="$RE_IPV6" 'NR>5 { gsub(/^ +| +$/, "", $3); if ($3 ~ re) print $3 }' \
                     "$dns_resolved_file" | sort -u
             fi
         fi
@@ -793,9 +831,9 @@ main() {
     local fqdn_count wildcard_count email_count
     fqdn_count=$(wc -l < "$all_fqdns_file" | tr -d ' ')
     wildcard_count=0
-    [ -f "$wildcards_file" ] && wildcard_count=$(wc -l < "$wildcards_file" | tr -d ' ')
+    if [ -f "$wildcards_file" ]; then wildcard_count=$(wc -l < "$wildcards_file" | tr -d ' '); fi
     email_count=0
-    [ -f "$emails_file" ] && email_count=$(wc -l < "$emails_file" | tr -d ' ')
+    if [ -f "$emails_file" ];    then email_count=$(wc    -l < "$emails_file"    | tr -d ' '); fi
 
     # -------------------------------------------------------------------------
     echo ""
@@ -806,17 +844,25 @@ main() {
     # Extraction des adresses IP uniques depuis dns_resolved.txt
     local ipv4_count=0 ipv6_count=0
     if [ -f "$dns_resolved_file" ]; then
-        # Colonne A (IPv4) : champ 2 après le premier |
-        # Colonne AAAA (IPv6) : champ 3 après le deuxième |
-        awk -F '|' 'NR>5 { gsub(/^ +| +$/, "", $2); if ($2 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $2 }' \
+        # Colonne A (IPv4) : champ 2 ; colonne AAAA (IPv6) : champ 3.
+        # On filtre strictement pour ignorer "N/A", lignes vides, séparateurs.
+        awk -F '|' -v re="$RE_IPV4" 'NR>5 { gsub(/^ +| +$/, "", $2); if ($2 ~ re) print $2 }' \
             "$dns_resolved_file" | sort -u > "$ipv4_file"
-        awk -F '|' 'NR>5 { gsub(/^ +| +$/, "", $3); if ($3 ~ /^[0-9a-fA-F:]+$/) print $3 }' \
+        awk -F '|' -v re="$RE_IPV6" 'NR>5 { gsub(/^ +| +$/, "", $3); if ($3 ~ re) print $3 }' \
             "$dns_resolved_file" | sort -u > "$ipv6_file"
         # Supprimer si vide
-        [ -s "$ipv4_file" ] && ipv4_count=$(wc -l < "$ipv4_file" | tr -d ' ') || rm -f "$ipv4_file"
-        [ -s "$ipv6_file" ] && ipv6_count=$(wc -l < "$ipv6_file" | tr -d ' ') || rm -f "$ipv6_file"
-        [ "$ipv4_count" -gt 0 ] && log_success "${ipv4_count} adresses IPv4 uniques extraites"
-        [ "$ipv6_count" -gt 0 ] && log_success "${ipv6_count} adresses IPv6 uniques extraites"
+        if [ -s "$ipv4_file" ]; then
+            ipv4_count=$(wc -l < "$ipv4_file" | tr -d ' ')
+            log_success "${ipv4_count} adresses IPv4 uniques extraites"
+        else
+            rm -f "$ipv4_file"
+        fi
+        if [ -s "$ipv6_file" ]; then
+            ipv6_count=$(wc -l < "$ipv6_file" | tr -d ' ')
+            log_success "${ipv6_count} adresses IPv6 uniques extraites"
+        else
+            rm -f "$ipv6_file"
+        fi
     fi
 
     # -------------------------------------------------------------------------

@@ -71,6 +71,7 @@ chmod +x ct-checker.sh
 |---|---|---|---|
 | `-d` | `DOMAINE` | **Oui** | FQDN cible à analyser |
 | `-o` | `DOSSIER` | Non | Dossier de sortie (défaut : `./<domaine>`) |
+| `-j` | `N` | Non | Résolutions DNS en parallèle (défaut : `10`) |
 | `-f` | — | Non | Afficher uniquement les FQDNs et wildcards sur stdout (pas de fichiers) |
 | `-4` | — | Non | Afficher uniquement les adresses IPv4 uniques sur stdout (pas de fichiers) |
 | `-6` | — | Non | Afficher uniquement les adresses IPv6 uniques sur stdout (pas de fichiers) |
@@ -88,6 +89,9 @@ chmod +x ct-checker.sh
 
 # Mode verbeux
 ./ct-checker.sh -d example.com -v
+
+# Parallélisme DNS personnalisé (utile pour les gros domaines)
+./ct-checker.sh -d example.com -j 20
 
 # FQDNs et wildcards uniquement (stdout)
 ./ct-checker.sh -d example.com -f
@@ -194,6 +198,7 @@ chmod +x ct-checker.sh
 |---|---|---|---|
 | `-d` | `DOMAIN` | **Yes** | Target FQDN to analyse |
 | `-o` | `DIR` | No | Output directory (default: `./<domain>`) |
+| `-j` | `N` | No | Parallel DNS resolutions (default: `10`) |
 | `-f` | — | No | Display only FQDNs and wildcards on stdout (no files written) |
 | `-4` | — | No | Display only unique IPv4 addresses on stdout (no files written) |
 | `-6` | — | No | Display only unique IPv6 addresses on stdout (no files written) |
@@ -211,6 +216,9 @@ chmod +x ct-checker.sh
 
 # Verbose mode
 ./ct-checker.sh -d example.com -v
+
+# Custom DNS parallelism (useful for large domains)
+./ct-checker.sh -d example.com -j 20
 
 # FQDNs and wildcards only (stdout)
 ./ct-checker.sh -d example.com -f
