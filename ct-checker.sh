@@ -14,7 +14,7 @@ set -euo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.2.1"
+readonly SCRIPT_VERSION="1.2.2"
 readonly CRT_SH_API="https://crt.sh"
 # Base PostgreSQL publique de crt.sh (fallback si le frontend web est en panne).
 readonly CRT_SH_PG="postgresql://guest@crt.sh:5432/certwatch"
@@ -406,23 +406,31 @@ _fetch_crtsh_pg() {
     _CLEANUP_FILES+=("$err_file")
 
     # Le domaine est passé en variable psql (:'dom') → aucune injection SQL possible.
-    # L'index plein-texte (plainto_tsquery @@ identities) assure la rapidité ; on
-    # regroupe par certificat et on ne garde que les identités du domaine cible
-    # (dNSName, commonName 2.5.4.3, e-mail rfc822Name) pour éviter les SANs étrangers.
+    # Perf : « certificate_and_identities » est une VUE qui re-parse chaque certificat
+    # X.509 pour en dériver les identités ; sans précaution, le planificateur surestime
+    # massivement la sélectivité du GIN (ex. ~10M lignes pour google.fr) et choisit un
+    # plan catastrophique → timeout. On force donc d'abord la matérialisation du petit
+    # ensemble de certificats via l'index plein-texte (CTE MATERIALIZED, qq milliers de
+    # lignes), PUIS on n'extrait/regroupe les noms que pour ces certs. On ne garde que
+    # les identités du domaine cible (dNSName, commonName 2.5.4.3, e-mail rfc822Name).
     # statement_timeout fixé côté serveur ; sed ne garde que la valeur JSON (purge
     # l'étiquette « SET »). « || true » neutralise pipefail : on valide via jq ensuite.
     PGCONNECT_TIMEOUT=15 psql "$CRT_SH_PG" -X -A -t -q \
         -v ON_ERROR_STOP=1 -v dom="$domain" 2>"$err_file" <<'SQL' | sed -n '/^\[/,$p' > "$output_file" || true
 SET statement_timeout TO '120000';
+WITH hits AS MATERIALIZED (
+  SELECT id FROM certificate
+  WHERE plainto_tsquery('certwatch', :'dom') @@ identities(certificate)
+)
 SELECT coalesce(json_agg(t), '[]'::json) FROM (
-  SELECT certificate_id AS id, string_agg(DISTINCT name_value, E'\n') AS name_value
-  FROM certificate_and_identities
-  WHERE plainto_tsquery('certwatch', :'dom') @@ identities(CERTIFICATE)
-    AND name_type IN ('san:dNSName','san:rfc822Name','2.5.4.3')
-    AND (lower(name_value) = lower(:'dom')
-         OR lower(name_value) LIKE lower('%.' || :'dom')
-         OR lower(name_value) LIKE lower('%@' || :'dom'))
-  GROUP BY certificate_id
+  SELECT cai.certificate_id AS id, string_agg(DISTINCT cai.name_value, E'\n') AS name_value
+  FROM certificate_and_identities cai
+  JOIN hits h ON h.id = cai.certificate_id
+  WHERE cai.name_type IN ('san:dNSName','san:rfc822Name','2.5.4.3')
+    AND (lower(cai.name_value) = lower(:'dom')
+         OR lower(cai.name_value) LIKE lower('%.' || :'dom')
+         OR lower(cai.name_value) LIKE lower('%@' || :'dom'))
+  GROUP BY cai.certificate_id
 ) t;
 SQL
 
@@ -505,6 +513,7 @@ extract_fqdns() {
     local fqdns_file="$2"
     local wildcards_file="$3"
     local emails_file="$4"
+    local domain="$5"
 
     log_info "Extraction des FQDNs uniques depuis les données CT..."
 
@@ -518,18 +527,32 @@ extract_fqdns() {
     #   - PostgreSQL    : octets non-ASCII bruts (0x80–0xFF)
     # Aucun de ces caractères n'est valide dans un FQDN/e-mail → on les retire, plus
     # les caractères de contrôle, puis on rogne les espaces ; les lignes vides sautent.
+    #
+    # Filtrage strict au domaine cible (même sémantique que la requête PostgreSQL :
+    # = dom, suffixe .dom, suffixe @dom). Indispensable côté web : crt.sh matche par
+    # sous-chaîne (q=google.fr remonte aussi *.google.frl, des SANs frères d'autres
+    # domaines, etc.). On compare par SUFFIXE (pas de regex) pour que le point du
+    # domaine reste littéral et ne devienne pas un joker. Idempotent sur la source PG
+    # (déjà filtrée) → les deux chemins produisent des sorties identiques en structure.
     local tmp_names
     tmp_names=$(mktemp -t ct_all_names.XXXXXX)
     _CLEANUP_FILES+=("$tmp_names")
 
     jq -r '.[].name_value' "$ct_file" \
-        | LC_ALL=C awk '{
-            gsub(/\\[0-7][0-7][0-7]/, "");   # échappements octaux crt.sh (texte littéral)
-            gsub(/[\200-\377]/, "");         # octets non-ASCII bruts (NBSP, mojibake…)
-            gsub(/[\001-\037]/, "");         # caractères de contrôle (tab, etc.)
-            gsub(/^[ ]+|[ ]+$/, "");         # espaces ASCII en tête/fin
-            if ($0 != "") print
-          }' \
+        | LC_ALL=C awk -v dom="$domain" '
+            function endswith(s, suf) {
+                return (length(s) >= length(suf) && substr(s, length(s) - length(suf) + 1) == suf);
+            }
+            BEGIN { dl = tolower(dom) }
+            {
+                gsub(/\\[0-7][0-7][0-7]/, "");   # échappements octaux crt.sh (texte littéral)
+                gsub(/[\200-\377]/, "");         # octets non-ASCII bruts (NBSP, mojibake…)
+                gsub(/[\001-\037]/, "");         # caractères de contrôle (tab, etc.)
+                gsub(/^[ ]+|[ ]+$/, "");         # espaces ASCII en tête/fin
+                if ($0 == "") next;
+                l = tolower($0);
+                if (l == dl || endswith(l, "." dl) || endswith(l, "@" dl)) print;
+            }' \
         | sort -u > "$tmp_names"
 
     # Crée les fichiers (vides) pour que les wc/test ultérieurs ne plantent pas.
@@ -946,7 +969,7 @@ main() {
         # Étape 2 : extraction FQDNs
         local all_fqdns_file="${tmpdir}/all_fqdns.txt"
         local wildcards_file="${tmpdir}/wildcards.txt"
-        extract_fqdns "$raw_ct_file" "$all_fqdns_file" "$wildcards_file" "${tmpdir}/emails.txt"
+        extract_fqdns "$raw_ct_file" "$all_fqdns_file" "$wildcards_file" "${tmpdir}/emails.txt" "$DOMAIN"
 
         if [ "$STDOUT_MODE" = "f" ]; then
             # Afficher FQDNs et wildcards sur stdout
@@ -1026,7 +1049,7 @@ main() {
     # -------------------------------------------------------------------------
     echo ""
     echo "${BOLD}━━━ ÉTAPE 2/4 : Extraction des FQDNs ━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    extract_fqdns "$raw_ct_file" "$all_fqdns_file" "$wildcards_file" "$emails_file"
+    extract_fqdns "$raw_ct_file" "$all_fqdns_file" "$wildcards_file" "$emails_file" "$DOMAIN"
     local fqdn_count wildcard_count email_count
     fqdn_count=$(wc -l < "$all_fqdns_file" | tr -d ' ')
     wildcard_count=0
