@@ -14,8 +14,10 @@ set -euo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.2.0"
 readonly CRT_SH_API="https://crt.sh"
+# Base PostgreSQL publique de crt.sh (fallback si le frontend web est en panne).
+readonly CRT_SH_PG="postgresql://guest@crt.sh:5432/certwatch"
 
 # ---------------------------------------------------------------------------
 # Couleurs (désactivées si stdout n'est pas un terminal)
@@ -40,6 +42,8 @@ DNS_PARALLEL="${DNS_PARALLEL:-10}"   # nombre de résolutions DNS en parallèle 
 OS_NAME="unknown"
 PKG_MANAGER=""
 _CLEANUP_FILES=()         # fichiers temporaires à supprimer en cas d'interruption
+_CRTSH_CODE1="000"        # dernier code HTTP crt.sh (requête sous-domaines) — diagnostic
+_CRTSH_CODE2="000"        # dernier code HTTP crt.sh (requête domaine exact) — diagnostic
 
 # ---------------------------------------------------------------------------
 # Fonctions de log
@@ -141,6 +145,15 @@ get_package_name() {
             esac ;;
         jq)   echo "jq"   ;;
         curl) echo "curl" ;;
+        psql)
+            case "$PKG_MANAGER" in
+                apt-get)       echo "postgresql-client" ;;
+                apk)           echo "postgresql-client" ;;
+                dnf|yum)       echo "postgresql"        ;;
+                pacman)        echo "postgresql"        ;;
+                zypper)        echo "postgresql"        ;;
+                *)             echo "postgresql-client" ;;
+            esac ;;
         *)    echo "$tool" ;;
     esac
 }
@@ -256,24 +269,74 @@ check_dependencies() {
     log_success "Toutes les dépendances sont prêtes"
 }
 
+# Installe un outil à la demande (chemin de secours uniquement, p.ex. psql pour le
+# fallback PostgreSQL). Retourne 0 si l'outil est disponible, 1 sinon — SANS quitter
+# le script, pour laisser l'appelant dégrader proprement.
+ensure_tool() {
+    local tool="$1"
+
+    if command -v "$tool" &>/dev/null; then
+        return 0
+    fi
+
+    log_warn "'$tool' absent — tentative d'installation (requis pour le fallback)..."
+
+    if [ -z "$PKG_MANAGER" ]; then
+        log_error "Aucun gestionnaire de paquets détecté : installez '$tool' manuellement."
+        return 1
+    fi
+
+    local sudo_cmd=""
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+        if command -v sudo &>/dev/null; then
+            sudo_cmd="sudo"
+        else
+            log_error "Droits root ou sudo requis pour installer '$tool'."
+            return 1
+        fi
+    fi
+
+    case "$PKG_MANAGER" in
+        apt-get) $sudo_cmd apt-get update -qq 2>/dev/null || true ;;
+        pacman)  $sudo_cmd pacman -Sy --noconfirm 2>/dev/null || true ;;
+        apk)     $sudo_cmd apk update 2>/dev/null || true ;;
+    esac
+
+    local pkg
+    pkg=$(get_package_name "$tool")
+    log_info "Installation de $tool (paquet : $pkg)..."
+
+    if ! install_package "$pkg" "$sudo_cmd"; then
+        log_error "Échec de l'installation de $pkg."
+        return 1
+    fi
+    if ! command -v "$tool" &>/dev/null; then
+        log_error "$tool toujours introuvable après installation."
+        return 1
+    fi
+
+    log_success "$tool installé avec succès"
+    return 0
+}
+
 # ---------------------------------------------------------------------------
-# Requête des CT logs via crt.sh
+# Requête des CT logs : crt.sh (web) avec retry, puis fallback PostgreSQL crt.sh
 # ---------------------------------------------------------------------------
-query_ct_logs() {
+# Source primaire : API web crt.sh (2 requêtes : sous-domaines + domaine exact).
+# Écrit le JSON fusionné dans $output_file et retourne 0 si OK, 1 sinon.
+# Ne quitte PAS le script : l'orchestrateur décide du retry/fallback.
+# Renseigne _CRTSH_CODE1/2 (codes HTTP) pour le diagnostic global.
+_fetch_crtsh() {
     local domain="$1"
     local output_file="$2"
-
-    log_info "Interrogation des CT logs via crt.sh..."
-    log_info "Agrège : Google, DigiCert, Cloudflare Nimbus, Sectigo, Let's Encrypt, etc."
-    log_info "(crt.sh peut être lent ou indisponible — patience, max ~60s par requête)"
 
     local tmp1 tmp2
     tmp1=$(mktemp -t ct_check.XXXXXX)
     tmp2=$(mktemp -t ct_check.XXXXXX)
     _CLEANUP_FILES+=("$tmp1" "$tmp2")
 
-    # Timeouts plus serrés pour éviter d'attendre 3+ minutes quand crt.sh
-    # rame ou renvoie des 5xx : 1ère tentative 45s, 1 retry, ~60s max au total.
+    # Timeouts serrés pour éviter d'attendre 3+ minutes quand crt.sh rame
+    # ou renvoie des 5xx : 1ère tentative 45s, 1 retry, ~60s max au total.
     local -a curl_opts=(
         -s --max-time 45 --retry 1 --retry-delay 3 --retry-max-time 60
         -H "Accept: application/json"
@@ -284,7 +347,6 @@ query_ct_logs() {
     local resp_code1 resp_code2
     resp_code1=$(curl "${curl_opts[@]}" -o "$tmp1" -w "%{http_code}" \
         "${CRT_SH_API}/?q=%25.${domain}&output=json" 2>/dev/null) || resp_code1="000"
-
     if [ "$resp_code1" != "200" ]; then
         log_warn "crt.sh a retourné HTTP $resp_code1 pour la requête sous-domaines"
     fi
@@ -293,29 +355,21 @@ query_ct_logs() {
     log_info "Requête 2/2 : domaine exact (${domain})..."
     resp_code2=$(curl "${curl_opts[@]}" -o "$tmp2" -w "%{http_code}" \
         "${CRT_SH_API}/?q=${domain}&output=json" 2>/dev/null) || resp_code2="000"
-
     if [ "$resp_code2" != "200" ]; then
         log_warn "crt.sh a retourné HTTP $resp_code2 pour la requête domaine exact"
     fi
 
-    # Validation JSON et fusion
+    _CRTSH_CODE1="$resp_code1"
+    _CRTSH_CODE2="$resp_code2"
+
+    # Validation JSON
     local valid1=false valid2=false
     if jq -e 'if type == "array" then . else error end' "$tmp1" &>/dev/null; then valid1=true; fi
     if jq -e 'if type == "array" then . else error end' "$tmp2" &>/dev/null; then valid2=true; fi
 
     if ! $valid1 && ! $valid2; then
-        log_error "Aucune réponse JSON valide depuis crt.sh."
-        # Aide au diagnostic : on distingue panne crt.sh (5xx) vs autre problème
-        if [[ "$resp_code1" =~ ^5 ]] || [[ "$resp_code2" =~ ^5 ]]; then
-            log_error "crt.sh semble en panne (HTTP 5xx). Réessayez dans quelques minutes."
-            log_error "Status : https://crt.sh/  ou  https://groups.google.com/g/crtsh"
-        elif [ "$resp_code1" = "000" ] && [ "$resp_code2" = "000" ]; then
-            log_error "Aucune réponse réseau. Vérifiez votre connexion internet."
-        else
-            log_error "Codes HTTP reçus : ${resp_code1} / ${resp_code2}"
-        fi
         rm -f "$tmp1" "$tmp2"
-        exit 1
+        return 1
     fi
 
     # Fusion et déduplication par ID de certificat
@@ -328,10 +382,119 @@ query_ct_logs() {
     fi
 
     rm -f "$tmp1" "$tmp2"
+    return 0
+}
 
-    local count
-    count=$(jq 'length' "$output_file")
-    log_success "${count} entrées de certificats trouvées dans les CT logs"
+# Fallback : base PostgreSQL publique de crt.sh (crt.sh:5432). Même jeu de données
+# que le frontend web, mais le contourne — utile quand le web renvoie des 5xx.
+# Produit EXACTEMENT le schéma attendu par extract_fqdns : un tableau JSON d'objets
+# {id, name_value}, un par certificat, name_value = SANs du domaine joints par \n.
+# Retourne 0 (tableau JSON valide écrit, éventuellement vide) ou 1 (échec).
+_fetch_crtsh_pg() {
+    local domain="$1"
+    local output_file="$2"
+
+    if ! ensure_tool psql; then
+        log_error "Le client PostgreSQL (psql) est requis pour le fallback mais indisponible."
+        return 1
+    fi
+
+    log_info "Interrogation de la base PostgreSQL crt.sh (peut prendre 1–2 min sur les gros domaines)..."
+
+    local err_file
+    err_file=$(mktemp -t ct_pg.XXXXXX)
+    _CLEANUP_FILES+=("$err_file")
+
+    # Le domaine est passé en variable psql (:'dom') → aucune injection SQL possible.
+    # L'index plein-texte (plainto_tsquery @@ identities) assure la rapidité ; on
+    # regroupe par certificat et on ne garde que les identités du domaine cible
+    # (dNSName, commonName 2.5.4.3, e-mail rfc822Name) pour éviter les SANs étrangers.
+    # statement_timeout fixé côté serveur ; sed ne garde que la valeur JSON (purge
+    # l'étiquette « SET »). « || true » neutralise pipefail : on valide via jq ensuite.
+    PGCONNECT_TIMEOUT=15 psql "$CRT_SH_PG" -X -A -t -q \
+        -v ON_ERROR_STOP=1 -v dom="$domain" 2>"$err_file" <<'SQL' | sed -n '/^\[/,$p' > "$output_file" || true
+SET statement_timeout TO '120000';
+SELECT coalesce(json_agg(t), '[]'::json) FROM (
+  SELECT certificate_id AS id, string_agg(DISTINCT name_value, E'\n') AS name_value
+  FROM certificate_and_identities
+  WHERE plainto_tsquery('certwatch', :'dom') @@ identities(CERTIFICATE)
+    AND name_type IN ('san:dNSName','san:rfc822Name','2.5.4.3')
+    AND (lower(name_value) = lower(:'dom')
+         OR lower(name_value) LIKE lower('%.' || :'dom')
+         OR lower(name_value) LIKE lower('%@' || :'dom'))
+  GROUP BY certificate_id
+) t;
+SQL
+
+    local pg_err=""
+    pg_err=$(cat "$err_file" 2>/dev/null || true)
+    rm -f "$err_file"
+
+    if ! jq -e 'if type == "array" then . else error end' "$output_file" &>/dev/null; then
+        log_error "Échec de la requête PostgreSQL crt.sh."
+        [ -n "$pg_err" ] && log_error "Détail : ${pg_err}"
+        return 1
+    fi
+
+    local n
+    n=$(jq 'length' "$output_file")
+    if [ "$n" -eq 0 ]; then
+        log_warn "Aucun certificat trouvé pour ${domain} dans la base PostgreSQL crt.sh."
+    fi
+    return 0
+}
+
+# Orchestrateur : crt.sh web (avec retry/backoff sur 5xx/000 transitoires),
+# puis bascule automatique vers la base PostgreSQL crt.sh si le web reste muet.
+query_ct_logs() {
+    local domain="$1"
+    local output_file="$2"
+
+    log_info "Interrogation des CT logs via crt.sh..."
+    log_info "Agrège : Google, DigiCert, Cloudflare Nimbus, Sectigo, Let's Encrypt, etc."
+    log_info "(crt.sh peut être lent ou indisponible — patience, max ~60s par requête)"
+
+    # 1) Source primaire : API web crt.sh, avec retry/backoff (les 502 sont souvent
+    #    transitoires : ils reviennent vite, le retry suffit dans la plupart des cas).
+    local attempt max_attempts=3
+    local -a backoff=(5 15)   # secondes d'attente avant la tentative suivante
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        if [ "$attempt" -gt 1 ]; then
+            log_info "crt.sh — tentative ${attempt}/${max_attempts}..."
+        fi
+        if _fetch_crtsh "$domain" "$output_file"; then
+            local count
+            count=$(jq 'length' "$output_file")
+            log_success "${count} entrées de certificats trouvées dans les CT logs"
+            return 0
+        fi
+        if [ "$attempt" -lt "$max_attempts" ]; then
+            local delay="${backoff[$((attempt-1))]:-15}"
+            log_warn "Réponse crt.sh invalide (HTTP ${_CRTSH_CODE1}/${_CRTSH_CODE2}). Nouvel essai dans ${delay}s..."
+            sleep "$delay"
+        fi
+    done
+
+    # 2) Fallback : base PostgreSQL publique de crt.sh (contourne le frontend web).
+    log_warn "crt.sh (web) indisponible après ${max_attempts} tentatives — bascule vers la base PostgreSQL crt.sh."
+    if _fetch_crtsh_pg "$domain" "$output_file"; then
+        local count
+        count=$(jq 'length' "$output_file")
+        log_success "${count} certificats récupérés via la base PostgreSQL crt.sh"
+        return 0
+    fi
+
+    # 3) Échec total : diagnostic puis sortie.
+    log_error "Aucune source CT n'a pu être interrogée (web + PostgreSQL)."
+    if [[ "$_CRTSH_CODE1" =~ ^5 ]] || [[ "$_CRTSH_CODE2" =~ ^5 ]]; then
+        log_error "crt.sh (web) semble en panne (HTTP 5xx) et le fallback PostgreSQL a échoué."
+        log_error "Status : https://crt.sh/  ou  https://groups.google.com/g/crtsh"
+    elif [ "$_CRTSH_CODE1" = "000" ] && [ "$_CRTSH_CODE2" = "000" ]; then
+        log_error "Aucune réponse réseau. Vérifiez votre connexion internet."
+    else
+        log_error "Codes HTTP crt.sh reçus : ${_CRTSH_CODE1} / ${_CRTSH_CODE2}"
+    fi
+    exit 1
 }
 
 # ---------------------------------------------------------------------------

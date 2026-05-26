@@ -22,6 +22,7 @@ Il est conçu pour fonctionner sur **n'importe quelle distribution GNU/Linux** e
 ### Fonctionnalités
 
 - Interroge **crt.sh**, qui agrège l'ensemble des CT logs publics (Google, DigiCert, Cloudflare, Sectigo, Let's Encrypt, etc.)
+- **Résilient aux pannes de crt.sh** : réessaie automatiquement le frontend web (les `HTTP 502` sont souvent transitoires), puis bascule en dernier recours sur la **base PostgreSQL publique de crt.sh** (`crt.sh:5432`) qui contourne le frontend web
 - Effectue **deux requêtes** : domaine exact + tous les sous-domaines (`%.domain.com`), puis fusionne et déduplique les résultats
 - Extrait tous les **FQDNs uniques** trouvés dans les certificats
 - Isole les **wildcards** (`*.domain.com`) dans un fichier séparé (non soumis à la vérification DNS)
@@ -52,6 +53,7 @@ Installées automatiquement si absentes :
 | `curl` | Requêtes HTTP vers l'API crt.sh |
 | `jq` | Parsing des réponses JSON |
 | `dig` | Résolution DNS (fallback automatique : `nslookup`, `host`) |
+| `psql` | **Installé à la demande** uniquement si le fallback PostgreSQL est déclenché (paquet `postgresql-client`) |
 
 ### Installation
 
@@ -135,6 +137,15 @@ Les résultats sont organisés par domaine et horodatés pour conserver l'histor
 - Trust Asia
 - Et bien d'autres...
 
+#### Tolérance aux pannes
+
+`crt.sh` peut renvoyer des erreurs `HTTP 502`/`503` lorsqu'il est surchargé. Le script gère cela automatiquement, sans option à activer :
+
+1. **Retry/backoff** sur le frontend web crt.sh (3 tentatives, délais croissants) — la plupart des 502 sont transitoires et disparaissent au 2ᵉ ou 3ᵉ essai.
+2. Si le web reste indisponible, **bascule automatique** sur la base **PostgreSQL publique de crt.sh** (`crt.sh:5432`, utilisateur `guest`), qui sert les mêmes données mais contourne le frontend web. `psql` est alors installé à la demande.
+
+> Les vrais logs CT (RFC 6962) ne sont pas interrogeables « par domaine » (journaux append-only sans index). Un agrégateur/index comme crt.sh est donc indispensable ; la base PostgreSQL de crt.sh en est l'accès direct. Elle renvoie l'historique complet (y compris les certificats expirés), le nombre de résultats peut donc être supérieur à celui du frontend web.
+
 ---
 
 <a id="english"></a>
@@ -149,6 +160,7 @@ It is designed to run on **any GNU/Linux distribution** and automatically instal
 ### Features
 
 - Queries **crt.sh**, which aggregates all public CT logs (Google, DigiCert, Cloudflare, Sectigo, Let's Encrypt, etc.)
+- **Resilient to crt.sh outages**: automatically retries the web frontend (`HTTP 502` errors are often transient), then falls back as a last resort to the **public crt.sh PostgreSQL database** (`crt.sh:5432`), which bypasses the web frontend
 - Performs **two queries**: exact domain + all subdomains (`%.domain.com`), then merges and deduplicates results
 - Extracts all **unique FQDNs** found in certificates
 - Isolates **wildcards** (`*.domain.com`) into a separate file (excluded from DNS verification)
@@ -179,6 +191,7 @@ Automatically installed if missing:
 | `curl` | HTTP requests to the crt.sh API |
 | `jq` | JSON response parsing |
 | `dig` | DNS resolution (automatic fallback: `nslookup`, `host`) |
+| `psql` | **Installed on demand** only if the PostgreSQL fallback is triggered (package `postgresql-client`) |
 
 ### Installation
 
@@ -261,3 +274,12 @@ Results are organised by domain and timestamped to preserve the history of analy
 - Let's Encrypt Oak
 - Trust Asia
 - And many more...
+
+#### Fault tolerance
+
+`crt.sh` may return `HTTP 502`/`503` errors when overloaded. The script handles this automatically, with no flag to enable:
+
+1. **Retry/backoff** against the crt.sh web frontend (3 attempts, increasing delays) — most 502s are transient and clear on the 2nd or 3rd try.
+2. If the web frontend stays unavailable, **automatic fallback** to the public **crt.sh PostgreSQL database** (`crt.sh:5432`, user `guest`), which serves the same data but bypasses the web frontend. `psql` is then installed on demand.
+
+> The raw CT logs (RFC 6962) cannot be queried "by domain" (append-only logs with no domain index), so an aggregator/index like crt.sh is required; the crt.sh PostgreSQL database is its direct-access form. It returns the full history (including expired certificates), so the result count may be higher than the web frontend's.
