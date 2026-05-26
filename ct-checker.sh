@@ -14,7 +14,7 @@ set -euo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.2.1"
 readonly CRT_SH_API="https://crt.sh"
 # Base PostgreSQL publique de crt.sh (fallback si le frontend web est en panne).
 readonly CRT_SH_PG="postgresql://guest@crt.sh:5432/certwatch"
@@ -509,13 +509,27 @@ extract_fqdns() {
     log_info "Extraction des FQDNs uniques depuis les données CT..."
 
     # name_value contient les SANs séparés par \n ; jq -r restitue ces \n en newlines.
-    # On nettoie (trim, dédup) puis on classe en 3 catégories en une seule passe awk.
+    # On nettoie chaque nom puis on classe en 3 catégories en une seule passe awk.
+    #
+    # Nettoyage (LC_ALL=C → awk en mode octet, déterministe) : certains certificats
+    # contiennent des octets parasites en tête de SAN (souvent un espace insécable
+    # mal encodé). Ils arrivent sous deux formes selon la source :
+    #   - crt.sh (web)  : échappements octaux en TEXTE littéral, p.ex. \303\202\302\240
+    #   - PostgreSQL    : octets non-ASCII bruts (0x80–0xFF)
+    # Aucun de ces caractères n'est valide dans un FQDN/e-mail → on les retire, plus
+    # les caractères de contrôle, puis on rogne les espaces ; les lignes vides sautent.
     local tmp_names
     tmp_names=$(mktemp -t ct_all_names.XXXXXX)
     _CLEANUP_FILES+=("$tmp_names")
 
     jq -r '.[].name_value' "$ct_file" \
-        | awk '{ gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "") print }' \
+        | LC_ALL=C awk '{
+            gsub(/\\[0-7][0-7][0-7]/, "");   # échappements octaux crt.sh (texte littéral)
+            gsub(/[\200-\377]/, "");         # octets non-ASCII bruts (NBSP, mojibake…)
+            gsub(/[\001-\037]/, "");         # caractères de contrôle (tab, etc.)
+            gsub(/^[ ]+|[ ]+$/, "");         # espaces ASCII en tête/fin
+            if ($0 != "") print
+          }' \
         | sort -u > "$tmp_names"
 
     # Crée les fichiers (vides) pour que les wc/test ultérieurs ne plantent pas.
