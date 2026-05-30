@@ -14,7 +14,7 @@ set -euo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.3.1"
 readonly CRT_SH_API="https://crt.sh"
 # Base PostgreSQL publique de crt.sh (fallback si le frontend web est en panne).
 readonly CRT_SH_PG="postgresql://guest@crt.sh:5432/certwatch"
@@ -859,15 +859,21 @@ generate_summary() {
         local _fp="${run_dir}/${_f}"
         if [ -f "$_fp" ]; then
             local _lc _label
-            if [ "$_f" = "raw_ct_logs.json" ]; then
-                # JSON multi-ligne : le nb de lignes est dénué de sens → on compte les
-                # certificats. (wc -l sur les autres : 1 enregistrement par ligne.)
-                _lc=$(jq 'length' "$_fp" 2>/dev/null || echo 0)
-                _label="certificats"
-            else
-                _lc=$(wc -l < "$_fp" | tr -d ' ')
-                _label="lignes"
-            fi
+            case "$_f" in
+                # JSON multi-ligne : le nb de lignes n'a aucun sens → on compte les certificats.
+                raw_ct_logs.json)   _lc=$(jq 'length' "$_fp" 2>/dev/null || echo 0); _label="certificats" ;;
+                # Fichiers DNS tabulaires : en-têtes + lignes de continuation (IP multiples)
+                # font que wc -l ≠ nb de FQDN → on réutilise les comptes exacts de verify_dns.
+                dns_resolved.txt)   _lc="$dns_resolved";   _label="FQDN" ;;
+                dns_unresolved.txt) _lc="$dns_unresolved"; _label="FQDN" ;;
+                # Les autres : 1 enregistrement par ligne → wc -l = le compte pertinent.
+                all_fqdns.txt)      _lc=$(wc -l < "$_fp" | tr -d ' '); _label="FQDN" ;;
+                wildcards.txt)      _lc=$(wc -l < "$_fp" | tr -d ' '); _label="wildcards" ;;
+                emails.txt)         _lc=$(wc -l < "$_fp" | tr -d ' '); _label="e-mails" ;;
+                ipv4_unique.txt)    _lc=$(wc -l < "$_fp" | tr -d ' '); _label="IPv4" ;;
+                ipv6_unique.txt)    _lc=$(wc -l < "$_fp" | tr -d ' '); _label="IPv6" ;;
+                *)                  _lc=$(wc -l < "$_fp" | tr -d ' '); _label="lignes" ;;
+            esac
             printf -v _entry "  %-38s %s %s\n" "$_f" "$_lc" "$_label"
             file_list+="$_entry"
         fi
