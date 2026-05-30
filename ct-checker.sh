@@ -14,7 +14,7 @@ set -euo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.2.2"
+readonly SCRIPT_VERSION="1.3.0"
 readonly CRT_SH_API="https://crt.sh"
 # Base PostgreSQL publique de crt.sh (fallback si le frontend web est en panne).
 readonly CRT_SH_PG="postgresql://guest@crt.sh:5432/certwatch"
@@ -42,6 +42,8 @@ DNS_PARALLEL="${DNS_PARALLEL:-10}"   # nombre de résolutions DNS en parallèle 
 OS_NAME="unknown"
 PKG_MANAGER=""
 _CLEANUP_FILES=()         # fichiers temporaires à supprimer en cas d'interruption
+_RUN_DIR=""               # dossier de résultats (mode normal) — purgé si le run échoue
+_SUCCESS=""               # passé à "1" quand le run aboutit (laisse alors run_dir en place)
 _CRTSH_CODE1="000"        # dernier code HTTP crt.sh (requête sous-domaines) — diagnostic
 _CRTSH_CODE2="000"        # dernier code HTTP crt.sh (requête domaine exact) — diagnostic
 
@@ -411,8 +413,10 @@ _fetch_crtsh_pg() {
     # massivement la sélectivité du GIN (ex. ~10M lignes pour google.fr) et choisit un
     # plan catastrophique → timeout. On force donc d'abord la matérialisation du petit
     # ensemble de certificats via l'index plein-texte (CTE MATERIALIZED, qq milliers de
-    # lignes), PUIS on n'extrait/regroupe les noms que pour ces certs. On ne garde que
-    # les identités du domaine cible (dNSName, commonName 2.5.4.3, e-mail rfc822Name).
+    # lignes), PUIS on regroupe par certificat ses identités (dNSName, commonName
+    # 2.5.4.3, e-mail rfc822Name). On NE refiltre PAS le domaine ici : c'est le filtre
+    # awk de extract_fqdns qui s'en charge, à l'identique, pour les deux sources (web
+    # et PG) — un WHERE SQL dédoublé divergeait sur l'apex à octet parasite en tête.
     # statement_timeout fixé côté serveur ; sed ne garde que la valeur JSON (purge
     # l'étiquette « SET »). « || true » neutralise pipefail : on valide via jq ensuite.
     PGCONNECT_TIMEOUT=15 psql "$CRT_SH_PG" -X -A -t -q \
@@ -427,9 +431,6 @@ SELECT coalesce(json_agg(t), '[]'::json) FROM (
   FROM certificate_and_identities cai
   JOIN hits h ON h.id = cai.certificate_id
   WHERE cai.name_type IN ('san:dNSName','san:rfc822Name','2.5.4.3')
-    AND (lower(cai.name_value) = lower(:'dom')
-         OR lower(cai.name_value) LIKE lower('%.' || :'dom')
-         OR lower(cai.name_value) LIKE lower('%@' || :'dom'))
   GROUP BY cai.certificate_id
 ) t;
 SQL
@@ -525,15 +526,18 @@ extract_fqdns() {
     # mal encodé). Ils arrivent sous deux formes selon la source :
     #   - crt.sh (web)  : échappements octaux en TEXTE littéral, p.ex. \303\202\302\240
     #   - PostgreSQL    : octets non-ASCII bruts (0x80–0xFF)
-    # Aucun de ces caractères n'est valide dans un FQDN/e-mail → on les retire, plus
-    # les caractères de contrôle, puis on rogne les espaces ; les lignes vides sautent.
+    # On retire ces échappements octaux puis TOUT octet non imprimable (non-ASCII,
+    # contrôle 0x01–0x1F ET DEL 0x7F), on rogne les espaces, et on REJETTE tout nom
+    # contenant un caractère hors charset FQDN/e-mail/wildcard [A-Za-z0-9._@*-] : cela
+    # élimine à la source les SANs piégés (« | » qui casserait les tables awk -F'|',
+    # guillemets/backslashes qui casseraient xargs, espaces internes…).
     #
-    # Filtrage strict au domaine cible (même sémantique que la requête PostgreSQL :
-    # = dom, suffixe .dom, suffixe @dom). Indispensable côté web : crt.sh matche par
-    # sous-chaîne (q=google.fr remonte aussi *.google.frl, des SANs frères d'autres
-    # domaines, etc.). On compare par SUFFIXE (pas de regex) pour que le point du
-    # domaine reste littéral et ne devienne pas un joker. Idempotent sur la source PG
-    # (déjà filtrée) → les deux chemins produisent des sorties identiques en structure.
+    # Filtrage strict au domaine cible — filtre canonique UNIQUE, appliqué aux DEUX
+    # sources (le SQL ne refiltre plus) : = dom, suffixe .dom, suffixe @dom. crt.sh
+    # (web) matche par sous-chaîne (q=google.fr remonte aussi *.google.frl, des SANs
+    # frères, etc.) ; on compare par SUFFIXE (pas de regex) pour que le point du
+    # domaine reste littéral et ne devienne pas un joker. Les deux chemins produisent
+    # ainsi des sorties identiques en structure.
     local tmp_names
     tmp_names=$(mktemp -t ct_all_names.XXXXXX)
     _CLEANUP_FILES+=("$tmp_names")
@@ -546,10 +550,10 @@ extract_fqdns() {
             BEGIN { dl = tolower(dom) }
             {
                 gsub(/\\[0-7][0-7][0-7]/, "");   # échappements octaux crt.sh (texte littéral)
-                gsub(/[\200-\377]/, "");         # octets non-ASCII bruts (NBSP, mojibake…)
-                gsub(/[\001-\037]/, "");         # caractères de contrôle (tab, etc.)
+                gsub(/[^[:print:]]/, "");        # tout octet non imprimable (non-ASCII, contrôle, DEL)
                 gsub(/^[ ]+|[ ]+$/, "");         # espaces ASCII en tête/fin
                 if ($0 == "") next;
+                if ($0 ~ /[^A-Za-z0-9._@*-]/) next;   # rejette tout caractère hors charset FQDN/e-mail/wildcard
                 l = tolower($0);
                 if (l == dl || endswith(l, "." dl) || endswith(l, "@" dl)) print;
             }' \
@@ -601,7 +605,12 @@ extract_fqdns() {
 # Regex IPv4 / IPv6 stricts. On utilise [.] plutôt que \. pour qu'awk ne râle pas
 # quand le pattern est passé via -v (où awk évalue les escapes).
 readonly RE_IPV4='^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$'
-readonly RE_IPV6='^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$'
+# IPv6 : groupes hexa séparés par « : », avec un éventuel quad IPv4 final
+# (forme ::ffff:1.2.3.4) — sinon ces AAAA légitimes seraient rejetés.
+readonly RE_IPV6='^([0-9a-fA-F]{0,4}:){1,7}([0-9a-fA-F]{0,4}|[0-9]{1,3}([.][0-9]{1,3}){3})$'
+# Cible plausible de CNAME (hostname pointé) — sert à écarter les jetons parasites
+# ("record", "answer:", lignes SOA…) que dig/host/nslookup peuvent émettre.
+readonly RE_HOST='^([A-Za-z0-9_-]+[.])+[A-Za-z]{2,}$'
 
 # Retourne les enregistrements DNS séparés par des virgules, ou chaîne vide.
 # Toutes les pipes utilisent || true pour rester compatibles avec set -e (grep
@@ -611,23 +620,31 @@ _resolve_dig() {
     local raw
     raw=$(dig +short +timeout=5 +tries=2 "$type" "$fqdn" 2>/dev/null \
         | { grep -v '^;' || true; } | { grep -v '^$' || true; })
-    # Pour A et AAAA, ne garder que les adresses IP (exclure les CNAME intermédiaires)
+    # Pour A et AAAA, ne garder que les adresses IP (exclure les CNAME intermédiaires).
+    # Pour CNAME, retirer le point final et n'accepter qu'un hostname plausible.
     case "$type" in
-        A)    raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
-        AAAA) raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
+        A)     raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
+        AAAA)  raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
+        CNAME) raw=$(echo "$raw" | sed 's/[.]$//' | { grep -E "$RE_HOST" || true; }) ;;
     esac
     echo "$raw" | { grep -v '^$' || true; } | tr '\n' ',' | sed 's/,$//'
 }
 
 _resolve_nslookup() {
     local fqdn="$1" type="$2"
-    local raw
-    raw=$(nslookup -type="$type" -timeout=5 "$fqdn" 2>/dev/null \
-        | { grep -Ev '^(Server|Address|$|;)' || true; } \
-        | awk '/^[^*]/ {print $NF}')
+    local out raw
+    out=$(nslookup -type="$type" -timeout=5 "$fqdn" 2>/dev/null)
+    # Les « Address: <ip> » de réponse suivent une ligne « Name: » ; la 1ère
+    # « Address: » (en-tête du résolveur, AVANT tout « Name: ») doit être ignorée.
+    # On NE peut PAS jeter en bloc les lignes « Address: » : elles portent les IP.
     case "$type" in
-        A)    raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
-        AAAA) raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
+        A|AAAA) raw=$(echo "$out" | awk '/^Name:/{seen=1} seen && /^Address:/{print $NF}') ;;
+        CNAME)  raw=$(echo "$out" | awk -F'= ' '/canonical name/{print $2}') ;;
+    esac
+    case "$type" in
+        A)     raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
+        AAAA)  raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
+        CNAME) raw=$(echo "$raw" | sed 's/[.]$//' | { grep -E "$RE_HOST" || true; }) ;;
     esac
     echo "$raw" | { grep -v '^$' || true; } | tr '\n' ',' | sed 's/,$//'
 }
@@ -639,8 +656,9 @@ _resolve_host() {
         | { grep -iv 'nxdomain\|not found\|servfail\|timed out' || true; } \
         | awk '{print $NF}')
     case "$type" in
-        A)    raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
-        AAAA) raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
+        A)     raw=$(echo "$raw" | { grep -E "$RE_IPV4" || true; }) ;;
+        AAAA)  raw=$(echo "$raw" | { grep -E "$RE_IPV6" || true; }) ;;
+        CNAME) raw=$(echo "$raw" | sed 's/[.]$//' | { grep -E "$RE_HOST" || true; }) ;;
     esac
     echo "$raw" | { grep -v '^$' || true; } | tr '\n' ',' | sed 's/,$//'
 }
@@ -700,7 +718,10 @@ verify_dns() {
     local unresolved_file="$3"
 
     local total
-    total=$(grep -c . "$fqdns_file" 2>/dev/null || echo 0)
+    # NB : surtout pas « grep -c . || echo 0 » → grep -c imprime « 0 » ET sort en
+    # code 1 sur fichier vide, le « || echo 0 » ajouterait un 2e « 0 » (chaîne
+    # multi-ligne « 0\n0 » qui casse les tests entiers en aval). wc -l est sûr.
+    total=$(wc -l < "$fqdns_file" | tr -d ' ')
     local parallel="${DNS_PARALLEL:-10}"
 
     log_info "Vérification DNS de ${total} FQDNs (outil : ${DNS_TOOL}, parallélisme : ${parallel})..."
@@ -712,13 +733,17 @@ verify_dns() {
     _CLEANUP_FILES+=("$tmp_csv")
 
     # Variables et fonctions à propager aux sous-shells xargs
-    export DNS_TOOL RE_IPV4 RE_IPV6
+    export DNS_TOOL RE_IPV4 RE_IPV6 RE_HOST
     export -f _resolve_dig _resolve_nslookup _resolve_host check_dns _dns_worker_csv
 
     if [ "$total" -gt 0 ]; then
-        # -P : parallélisme  -I {} : substitution (implique -n 1)
-        xargs -P "$parallel" -I {} bash -c '_dns_worker_csv "$@"' _ {} \
-            < "$fqdns_file" > "$tmp_csv"
+        # Entrée délimitée par NUL + xargs -0 : les éventuels guillemets/backslashes
+        # d'un nom parasite sont traités littéralement (sans -0, xargs casse sur un
+        # guillemet non apparié → toute la suite du lot DNS est perdue, voire abandon
+        # du script en mode -4/-6). -P : parallélisme  -I {} : substitution.
+        tr '\n' '\0' < "$fqdns_file" \
+            | xargs -0 -P "$parallel" -I {} bash -c '_dns_worker_csv "$@"' _ {} \
+            > "$tmp_csv"
     fi
 
     # Compte les résultats
@@ -833,9 +858,17 @@ generate_summary() {
     for _f in "${_known_files[@]}"; do
         local _fp="${run_dir}/${_f}"
         if [ -f "$_fp" ]; then
-            local _lc
-            _lc=$(grep -c . "$_fp" 2>/dev/null || echo 0)
-            printf -v _entry "  %-38s %s lignes\n" "$_f" "$_lc"
+            local _lc _label
+            if [ "$_f" = "raw_ct_logs.json" ]; then
+                # JSON multi-ligne : le nb de lignes est dénué de sens → on compte les
+                # certificats. (wc -l sur les autres : 1 enregistrement par ligne.)
+                _lc=$(jq 'length' "$_fp" 2>/dev/null || echo 0)
+                _label="certificats"
+            else
+                _lc=$(wc -l < "$_fp" | tr -d ' ')
+                _label="lignes"
+            fi
+            printf -v _entry "  %-38s %s %s\n" "$_f" "$_lc" "$_label"
             file_list+="$_entry"
         fi
     done
@@ -911,9 +944,16 @@ parse_args() {
         usage
     fi
 
+    # FQDN absolu : on retire un éventuel point final avant validation ET usage
+    # (sinon il fuiterait dans le nom de dossier et le paramètre q= de crt.sh).
+    DOMAIN="${DOMAIN%.}"
+
     # Validation basique du format FQDN
     if ! echo "$DOMAIN" | grep -qE \
         '^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$'; then
+        if printf '%s' "$DOMAIN" | LC_ALL=C grep -q '[^ -~]'; then
+            log_error "Domaine non-ASCII (IDN) détecté : convertissez-le en punycode (forme xn--…) avant usage."
+        fi
         log_error "Format de domaine invalide : $DOMAIN"
         exit 1
     fi
@@ -922,24 +962,41 @@ parse_args() {
 # ---------------------------------------------------------------------------
 # Nettoyage en cas d'interruption
 # ---------------------------------------------------------------------------
+# Gère INT/TERM (signaux) ET EXIT (toute fin de script, y compris un abandon
+# set -euo pipefail). C'est EXIT qui couvre le mode d'échec dominant d'un script
+# errexit — une commande qui retourne non-zéro — que INT/TERM ne voyaient pas.
 cleanup() {
-    local sig="${1:-INT}"
+    local sig="${1:-EXIT}"
+    # Anti-réentrance : on neutralise tout autre signal pendant le nettoyage,
+    # sinon un 2e signal pourrait ré-invoquer ce handler en pleine exécution.
+    trap - INT TERM EXIT
+
     if [ ${#_CLEANUP_FILES[@]} -gt 0 ]; then
         rm -f "${_CLEANUP_FILES[@]}" 2>/dev/null || true
     fi
     _CLEANUP_FILES=()
-    printf "\r%80s\r" "" >&2
-    log_warn "Interruption détectée. Fichiers temporaires nettoyés."
-    # Le trap par défaut continue l'exécution après le handler ; on doit donc
-    # forcer un exit ici, sinon le script poursuit avec un état incohérent
-    # (curl interrompu, fichiers temp absents, etc.).
+    if [ -n "${STDOUT_TMPDIR:-}" ]; then rm -rf "$STDOUT_TMPDIR" 2>/dev/null || true; fi
+
+    # Dossier de résultats partiel : on le retire si le run n'a pas abouti, pour ne
+    # pas laisser une sortie incomplète qui passerait pour complète.
+    if [ -z "${_SUCCESS:-}" ] && [ -n "${_RUN_DIR:-}" ] && [ -d "$_RUN_DIR" ]; then
+        rm -rf "$_RUN_DIR" 2>/dev/null || true
+    fi
+
+    # Sur signal uniquement : message + code de sortie adéquat (sur EXIT, on laisse
+    # le script se terminer avec son propre code).
     case "$sig" in
-        TERM) exit 143 ;;
-        *)    exit 130 ;;
+        INT|TERM)
+            printf "\r%80s\r" "" >&2
+            log_warn "Interruption détectée. Fichiers temporaires nettoyés."
+            [ "$sig" = "TERM" ] && exit 143
+            exit 130
+            ;;
     esac
 }
 trap 'cleanup INT'  INT
 trap 'cleanup TERM' TERM
+trap 'cleanup EXIT' EXIT
 
 # ---------------------------------------------------------------------------
 # Point d'entrée principal
@@ -949,8 +1006,7 @@ main() {
 
     # --- Mode stdout (-f / -4 / -6) : tout dans un tmpdir, affichage sur stdout ---
     if [ -n "$STDOUT_MODE" ]; then
-        STDOUT_TMPDIR=$(mktemp -d -t ct_checker.XXXXXX)
-        trap 'rm -rf "$STDOUT_TMPDIR"' EXIT
+        STDOUT_TMPDIR=$(mktemp -d -t ct_checker.XXXXXX)   # purgé par le trap EXIT global
         local tmpdir="$STDOUT_TMPDIR"
 
         detect_os
@@ -1026,6 +1082,7 @@ main() {
     timestamp=$(date '+%Y%m%d_%H%M%S')
     local run_dir="${OUTPUT_DIR}/${DOMAIN}_${timestamp}"
     mkdir -p "$run_dir"
+    _RUN_DIR="$run_dir"   # suivi pour le trap : purgé si le run n'aboutit pas
     log_success "Dossier de sortie : $run_dir"
 
     # Chemins des fichiers de sortie
@@ -1100,6 +1157,8 @@ main() {
     cat "$summary_file"
     echo ""
     echo "${BLUE}Résultats complets dans :${NC} ${BOLD}${run_dir}/${NC}"
+
+    _SUCCESS=1   # run abouti → le trap EXIT conserve run_dir
 }
 
 main "$@"
