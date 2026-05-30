@@ -14,7 +14,7 @@ set -euo pipefail
 # Métadonnées
 # ---------------------------------------------------------------------------
 readonly SCRIPT_NAME="ct-checker.sh"
-readonly SCRIPT_VERSION="1.3.1"
+readonly SCRIPT_VERSION="1.3.2"
 readonly CRT_SH_API="https://crt.sh"
 # Base PostgreSQL publique de crt.sh (fallback si le frontend web est en panne).
 readonly CRT_SH_PG="postgresql://guest@crt.sh:5432/certwatch"
@@ -519,6 +519,12 @@ extract_fqdns() {
     log_info "Extraction des FQDNs uniques depuis les données CT..."
 
     # name_value contient les SANs séparés par \n ; jq -r restitue ces \n en newlines.
+    # On lit AUSSI .common_name (CN du sujet) : certains certificats (vieux Let's
+    # Encrypt notamment) portent un CN absent des SANs, p.ex. CN=www.example.com avec
+    # SAN={example.com} seul. Sans le CN, ces hôtes ne seraient JAMAIS découverts par
+    # le chemin web. Le fallback PG, lui, inclut déjà le CN (OID 2.5.4.3) dans
+    # name_value et n'a pas de champ common_name → « // empty » n'émet rien de plus
+    # (pas de doublon, pas de ligne « null »). Les deux sources restent cohérentes.
     # On nettoie chaque nom puis on classe en 3 catégories en une seule passe awk.
     #
     # Nettoyage (LC_ALL=C → awk en mode octet, déterministe) : certains certificats
@@ -542,7 +548,7 @@ extract_fqdns() {
     tmp_names=$(mktemp -t ct_all_names.XXXXXX)
     _CLEANUP_FILES+=("$tmp_names")
 
-    jq -r '.[].name_value' "$ct_file" \
+    jq -r '.[] | .name_value, (.common_name // empty)' "$ct_file" \
         | LC_ALL=C awk -v dom="$domain" '
             function endswith(s, suf) {
                 return (length(s) >= length(suf) && substr(s, length(s) - length(suf) + 1) == suf);
