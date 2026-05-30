@@ -80,6 +80,8 @@ chmod +x ct-checker.sh
 | `-v` | — | Non | Mode verbeux (détails des requêtes) |
 | `-h` | — | Non | Afficher l'aide |
 
+> **Domaines internationalisés (IDN)** : fournissez-les en **punycode** (forme `xn--…`). Un domaine non-ASCII (ex. `café.fr`) est refusé avec un message le rappelant. Un éventuel point final (`example.com.`) est accepté et retiré automatiquement.
+
 ### Exemples
 
 ```bash
@@ -217,6 +219,8 @@ chmod +x ct-checker.sh
 | `-6` | — | No | Display only unique IPv6 addresses on stdout (no files written) |
 | `-v` | — | No | Verbose mode (query details) |
 | `-h` | — | No | Show help |
+
+> **Internationalised domains (IDN)**: provide them in **punycode** (`xn--…` form). A non-ASCII domain (e.g. `café.fr`) is rejected with a reminder message. A trailing dot (`example.com.`) is accepted and stripped automatically.
 
 ### Examples
 
